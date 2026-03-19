@@ -12,6 +12,7 @@ from app.modules.backtest.models import BacktestRecord, HistoricalKline
 from app.modules.backtest.schemas import (
     BacktestRequest,
     BatchBacktestRequest,
+    GridSearchRequest,
     AvailableDataItem,
     BacktestRecordResponse,
     BacktestRecordDetail,
@@ -387,3 +388,89 @@ async def batch_run(body: BatchBacktestRequest, db: DB, user: User = Depends(get
             output.append({"index": i, **r})
 
     return _wrap(output)
+
+
+# ============ 网格搜索 ============
+
+_VALID_SORT_KEYS = {"sharpe_ratio", "total_return_pct", "calmar_ratio", "max_drawdown", "profit_factor"}
+_SORT_ASCENDING = {"max_drawdown"}  # 这些指标越小越好
+
+
+@router.post("/grid-search")
+async def grid_search(body: GridSearchRequest, db: DB, user: User = Depends(get_current_user)):
+    """
+    参数网格搜索：自动展开笛卡尔积，并发回测所有组合，按指标排序后返回前 N 名。
+
+    grid 中每个字段传候选值列表，未指定的字段使用 base 中的值。
+    sort_by 支持：sharpe_ratio（默认）/ total_return_pct / calmar_ratio /
+                  max_drawdown（越小越好）/ profit_factor
+    top_n 默认 10，最大 50。
+
+    示例：扫 leverage=[1,2,3,5] x risk=[2,3,5] x sl=[2,3] x tp=[6,9,12] = 72 组，
+    一次请求，返回 sharpe 最高的 10 个参数组合。
+    """
+    if body.sort_by not in _VALID_SORT_KEYS:
+        raise HTTPException(status_code=400, detail=f"sort_by 必须是: {', '.join(_VALID_SORT_KEYS)}")
+
+    top_n = min(body.top_n, 50)
+
+    # 展开笛卡尔积
+    grid = body.grid
+    axes: dict[str, list] = {}
+    if grid.leverage:
+        axes["leverage"] = grid.leverage
+    if grid.risk_per_trade:
+        axes["risk_per_trade"] = grid.risk_per_trade
+    if grid.stop_loss_pct:
+        axes["stop_loss_pct"] = grid.stop_loss_pct
+    if grid.take_profit_pct:
+        axes["take_profit_pct"] = grid.take_profit_pct
+    if grid.initial_balance:
+        axes["initial_balance"] = grid.initial_balance
+
+    if not axes:
+        raise HTTPException(status_code=400, detail="grid 中至少指定一个参数")
+
+    # 笛卡尔积
+    import itertools
+    keys = list(axes.keys())
+    combos = list(itertools.product(*[axes[k] for k in keys]))
+
+    if len(combos) > 200:
+        raise HTTPException(status_code=400, detail=f"参数组合数 {len(combos)} 超过上限 200，请缩小搜索范围")
+
+    # 为每个组合构造 BacktestRequest（覆盖 base 中对应字段）
+    runs: list[BacktestRequest] = []
+    param_labels: list[dict] = []
+    for combo in combos:
+        overrides = dict(zip(keys, combo))
+        req_data = body.base.model_dump()
+        req_data.update(overrides)
+        req_data["include_trades"] = False  # 网格搜索不需要交易列表
+        runs.append(BacktestRequest(**req_data))
+        param_labels.append(overrides)
+
+    # 并发执行
+    results = await asyncio.gather(
+        *[_run_single(req, db, str(user.id)) for req in runs],
+        return_exceptions=True,
+    )
+
+    # 整合结果，过滤异常和无数据
+    combined = []
+    for params, result in zip(param_labels, results):
+        if isinstance(result, Exception) or "error" in result:
+            continue
+        combined.append({"params": params, **result})
+
+    # 排序
+    reverse = body.sort_by not in _SORT_ASCENDING
+    combined.sort(key=lambda x: x.get(body.sort_by, 0), reverse=reverse)
+
+    return _wrap({
+        "total_combinations": len(combos),
+        "valid_results": len(combined),
+        "sort_by": body.sort_by,
+        "top_n": top_n,
+        "results": combined[:top_n],
+    })

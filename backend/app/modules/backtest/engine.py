@@ -1005,8 +1005,8 @@ def _empty_result(initial_balance: float = 10000.0):
     return {
         "total_return_pct": 0.0, "final_balance": initial_balance,
         "win_rate": 0, "profit_factor": 0,
-        "max_drawdown": 0, "sharpe_ratio": 0, "total_trades": 0,
-        "avg_holding_hours": 0, "trades": [],
+        "max_drawdown": 0, "sharpe_ratio": 0, "calmar_ratio": 0,
+        "total_trades": 0, "avg_holding_hours": 0, "trades": [],
     }
 
 
@@ -1023,13 +1023,18 @@ def _calc_stats(trades, balance, initial_balance, max_drawdown, include_trades: 
     avg_return = sum(returns) / len(returns)
     std_return = math.sqrt(sum((r - avg_return) ** 2 for r in returns) / len(returns)) if len(returns) > 1 else 1
 
+    total_return_pct = round(((balance - initial_balance) / initial_balance) * 100, 2)
+    max_drawdown_r = round(max_drawdown, 2)
+    calmar = round(total_return_pct / max_drawdown_r, 2) if max_drawdown_r > 0 else 0.0
+
     return {
-        "total_return_pct": round(((balance - initial_balance) / initial_balance) * 100, 2),
+        "total_return_pct": total_return_pct,
         "final_balance": round(balance, 2),
         "win_rate": round(len(wins) / len(trades) * 100, 1),
         "profit_factor": round(total_profit / total_loss, 2) if total_loss > 0 else 0,
-        "max_drawdown": round(max_drawdown, 2),
+        "max_drawdown": max_drawdown_r,
         "sharpe_ratio": round(avg_return / std_return, 2) if std_return > 0 else 0,
+        "calmar_ratio": calmar,
         "total_trades": len(trades),
         "avg_holding_hours": round(sum(float(t["duration"].rstrip("h")) for t in trades) / len(trades), 1),
         "trades": trades if include_trades else [],

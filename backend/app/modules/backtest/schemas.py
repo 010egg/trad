@@ -153,3 +153,19 @@ class AvailableDataItem(BaseModel):
     count: int
     start_date: str  # 最早K线日期 YYYY-MM-DD
     end_date: str    # 最新K线日期 YYYY-MM-DD
+
+
+class GridSearchParams(BaseModel):
+    """可以被网格搜索扫描的参数，每个字段传一个值列表"""
+    leverage: list[int] | None = None
+    risk_per_trade: list[float] | None = None
+    stop_loss_pct: list[float] | None = None
+    take_profit_pct: list[float] | None = None
+    initial_balance: list[float] | None = None
+
+
+class GridSearchRequest(BaseModel):
+    base: BacktestRequest              # 固定参数（symbol/interval/conditions 等）
+    grid: GridSearchParams             # 要扫描的参数及候选值列表
+    sort_by: str = "sharpe_ratio"      # 排序指标：sharpe_ratio / total_return_pct / max_drawdown / calmar_ratio
+    top_n: int = 10                    # 只返回前 N 名

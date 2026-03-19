@@ -76,8 +76,20 @@ function formatNumber(value: number, digits: number = 2): string {
   return Number.isFinite(value) ? value.toFixed(digits) : '--'
 }
 
-function formatPercent(value: number, digits: number = 2): string {
-  return `${value > 0 ? '+' : ''}${formatNumber(value, digits)}%`
+function formatPercent(value: number, digits: number = 2, signed: boolean = false): string {
+  return `${signed && value > 0 ? '+' : ''}${formatNumber(value, digits)}%`
+}
+
+function formatMultiplier(value: number, digits: number = 0): string {
+  return `${formatNumber(value, digits)}x`
+}
+
+function formatHours(value: number, digits: number = 1): string {
+  return `${formatNumber(value, digits)}h`
+}
+
+function formatAssetAmount(value: number, asset: string | null, digits: number = 2, signed: boolean = false): string {
+  return `${signed && value > 0 ? '+' : ''}${formatNumber(value, digits)} ${asset || 'quote_asset'}`
 }
 
 function escapeMarkdownCell(value: string | number): string {
@@ -115,37 +127,17 @@ function buildAiRecord(detail: BacktestRecordDetail, entryConditions: StoredCond
     side: trade.side,
     entry_time: trade.entry_time,
     exit_time: trade.exit_time,
-    entry_price: trade.entry_price,
-    exit_price: trade.exit_price,
-    price_unit: quoteAsset ? `${quoteAsset}_per_base_asset` : 'quote_asset_price',
-    pnl_amount: trade.pnl,
-    pnl_amount_unit: quoteAsset || 'quote_asset',
-    pnl_pct: trade.pnl_pct,
-    pnl_pct_unit: 'percent',
-    pnl_pct_basis: 'backtest_engine_reported_trade_return',
+    entry_price: formatAssetAmount(trade.entry_price, quoteAsset, 2),
+    exit_price: formatAssetAmount(trade.exit_price, quoteAsset, 2),
+    pnl: formatAssetAmount(trade.pnl, quoteAsset, 2, true),
+    pnl_pct: formatPercent(trade.pnl_pct, 2, true),
+    duration: trade.duration,
     duration_hours: parseDurationHours(trade.duration),
-    duration_original: trade.duration,
   }))
 
   return {
-    schema_version: 'backtest_record_export_v2',
+    schema_version: 'backtest_record_export_v3',
     export_purpose: 'ai_readable_backtest_record',
-    units_guide: {
-      leverage_x: 'multiple',
-      stop_loss_price_move_pct: 'percent_of_underlying_price_move',
-      take_profit_price_move_pct: 'percent_of_underlying_price_move',
-      risk_per_trade_equity_pct: 'percent_of_account_equity',
-      total_return_pct: 'percent_of_initial_balance',
-      win_rate_pct: 'percent_of_closed_trades',
-      profit_factor_ratio: 'ratio',
-      max_drawdown_pct: 'percent_of_equity_peak',
-      sharpe_ratio: 'dimensionless',
-      avg_holding_hours: 'hours',
-      account_balance_unit: quoteAsset || 'quote_asset',
-      trade_price_unit: quoteAsset ? `${quoteAsset}_per_base_asset` : 'quote_asset_price',
-      trade_pnl_amount_unit: quoteAsset || 'quote_asset',
-      trade_pnl_pct_unit: 'percent',
-    },
     record: {
       id: detail.id,
       name: detail.name,
@@ -154,20 +146,20 @@ function buildAiRecord(detail: BacktestRecordDetail, entryConditions: StoredCond
       interval: detail.interval,
       start_date: detail.start_date,
       end_date: detail.end_date,
-      leverage_x: detail.leverage,
-      stop_loss_price_move_pct: detail.stop_loss_pct,
-      take_profit_price_move_pct: detail.take_profit_pct,
-      risk_per_trade_equity_pct: detail.risk_per_trade,
-      initial_balance_amount: detail.initial_balance,
-      final_balance_amount: detail.final_balance,
+      leverage: formatMultiplier(detail.leverage),
+      stop_loss_pct: formatPercent(detail.stop_loss_pct),
+      take_profit_pct: formatPercent(detail.take_profit_pct),
+      risk_per_trade: formatPercent(detail.risk_per_trade),
+      initial_balance: formatAssetAmount(detail.initial_balance, quoteAsset, 2),
+      final_balance: formatAssetAmount(detail.final_balance, quoteAsset, 2),
       metrics: {
-        total_return_pct: detail.total_return_pct,
-        win_rate_pct: detail.win_rate,
-        profit_factor_ratio: detail.profit_factor,
-        max_drawdown_pct: detail.max_drawdown,
-        sharpe_ratio: detail.sharpe_ratio,
-        total_trades_count: detail.total_trades,
-        avg_holding_hours: detail.avg_holding_hours,
+        total_return_pct: formatPercent(detail.total_return_pct, 2, true),
+        win_rate: formatPercent(detail.win_rate, 1),
+        profit_factor: formatMultiplier(detail.profit_factor, 2),
+        max_drawdown: formatPercent(detail.max_drawdown),
+        sharpe_ratio: formatNumber(detail.sharpe_ratio),
+        total_trades: detail.total_trades,
+        avg_holding_hours: formatHours(detail.avg_holding_hours, 1),
       },
       strategy_conditions: {
         entry_conditions: entryConditions,
@@ -194,28 +186,29 @@ function buildBacktestMarkdown(detail: BacktestRecordDetail): string {
     `- record_id: ${detail.id}`,
     '',
     '## record_fields',
-    '| field | value | unit |',
-    '| --- | --- | --- |',
-    `| id | ${escapeMarkdownCell(detail.id)} | string |`,
-    `| name | ${escapeMarkdownCell(detail.name)} | string |`,
-    `| symbol | ${escapeMarkdownCell(detail.symbol)} | trading_symbol |`,
-    `| interval | ${escapeMarkdownCell(detail.interval)} | kline_interval |`,
-    `| start_date | ${escapeMarkdownCell(detail.start_date)} | calendar_date |`,
-    `| end_date | ${escapeMarkdownCell(detail.end_date)} | calendar_date |`,
-    `| leverage | ${detail.leverage} | x |`,
-    `| initial_balance | ${formatNumber(detail.initial_balance)} | ${quoteAsset || 'quote_asset'} |`,
-    `| stop_loss_pct | ${formatNumber(detail.stop_loss_pct)} | percent_of_underlying_price_move |`,
-    `| take_profit_pct | ${formatNumber(detail.take_profit_pct)} | percent_of_underlying_price_move |`,
-    `| risk_per_trade | ${formatNumber(detail.risk_per_trade)} | percent_of_account_equity |`,
-    `| total_return_pct | ${formatPercent(detail.total_return_pct)} | percent_of_initial_balance |`,
-    `| final_balance | ${formatNumber(detail.final_balance)} | ${quoteAsset || 'quote_asset'} |`,
-    `| win_rate | ${formatNumber(detail.win_rate, 1)}% | percent_of_closed_trades |`,
-    `| profit_factor | ${formatNumber(detail.profit_factor)}x | ratio |`,
-    `| max_drawdown | ${formatNumber(detail.max_drawdown)}% | percent_of_equity_peak |`,
-    `| sharpe_ratio | ${formatNumber(detail.sharpe_ratio)} | dimensionless |`,
-    `| total_trades | ${detail.total_trades} | count |`,
-    `| avg_holding_hours | ${formatNumber(detail.avg_holding_hours, 1)}h | hours |`,
-    `| created_at | ${escapeMarkdownCell(detail.created_at)} | datetime_string |`,
+    '| field | value |',
+    '| --- | --- |',
+    `| id | ${escapeMarkdownCell(detail.id)} |`,
+    `| name | ${escapeMarkdownCell(detail.name)} |`,
+    `| symbol | ${escapeMarkdownCell(detail.symbol)} |`,
+    `| quote_asset | ${escapeMarkdownCell(quoteAsset || 'quote_asset')} |`,
+    `| interval | ${escapeMarkdownCell(detail.interval)} |`,
+    `| start_date | ${escapeMarkdownCell(detail.start_date)} |`,
+    `| end_date | ${escapeMarkdownCell(detail.end_date)} |`,
+    `| leverage | ${formatMultiplier(detail.leverage)} |`,
+    `| initial_balance | ${formatAssetAmount(detail.initial_balance, quoteAsset, 2)} |`,
+    `| stop_loss_pct | ${formatPercent(detail.stop_loss_pct)} |`,
+    `| take_profit_pct | ${formatPercent(detail.take_profit_pct)} |`,
+    `| risk_per_trade | ${formatPercent(detail.risk_per_trade)} |`,
+    `| total_return_pct | ${formatPercent(detail.total_return_pct, 2, true)} |`,
+    `| final_balance | ${formatAssetAmount(detail.final_balance, quoteAsset, 2)} |`,
+    `| win_rate | ${formatPercent(detail.win_rate, 1)} |`,
+    `| profit_factor | ${formatMultiplier(detail.profit_factor, 2)} |`,
+    `| max_drawdown | ${formatPercent(detail.max_drawdown)} |`,
+    `| sharpe_ratio | ${formatNumber(detail.sharpe_ratio)} |`,
+    `| total_trades | ${detail.total_trades} |`,
+    `| avg_holding_hours | ${formatHours(detail.avg_holding_hours, 1)} |`,
+    `| created_at | ${escapeMarkdownCell(detail.created_at)} |`,
     '',
     '## entry_conditions',
     '```json',
@@ -230,7 +223,7 @@ function buildBacktestMarkdown(detail: BacktestRecordDetail): string {
     '## trades_table',
     trades.length === 0 ? '- []' : '| # | side | entry_time | exit_time | entry_price | exit_price | pnl | pnl_pct | duration |',
     trades.length === 0 ? '' : '| --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- |',
-    ...trades.map((trade, index) => `| ${index + 1} | ${escapeMarkdownCell(trade.side)} | ${escapeMarkdownCell(trade.entry_time)} | ${escapeMarkdownCell(trade.exit_time)} | ${formatNumber(trade.entry_price)} | ${formatNumber(trade.exit_price)} | ${formatNumber(trade.pnl)} | ${formatPercent(trade.pnl_pct)} | ${escapeMarkdownCell(trade.duration)} |`),
+    ...trades.map((trade, index) => `| ${index + 1} | ${escapeMarkdownCell(trade.side)} | ${escapeMarkdownCell(trade.entry_time)} | ${escapeMarkdownCell(trade.exit_time)} | ${formatAssetAmount(trade.entry_price, quoteAsset, 2)} | ${formatAssetAmount(trade.exit_price, quoteAsset, 2)} | ${formatAssetAmount(trade.pnl, quoteAsset, 2, true)} | ${formatPercent(trade.pnl_pct, 2, true)} | ${escapeMarkdownCell(trade.duration)} |`),
     '',
     '## trades_json',
     '```json',
