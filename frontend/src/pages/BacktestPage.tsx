@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router'
 import api from '@/lib/api'
 import { MainLayout } from '@/layouts/MainLayout'
-import { useBacktestStore, type BacktestRecordDetail } from '@/stores/useBacktestStore'
+import { useBacktestStore, type BacktestRecord, type BacktestRecordDetail } from '@/stores/useBacktestStore'
 import { useBacktestSignalStore } from '@/stores/useBacktestSignalStore'
 
 interface Trade {
@@ -260,6 +260,24 @@ function ConditionEditor({ cond, onChange, onRemove }: { cond: Condition; onChan
 
 const LEVERAGE_PRESETS = [1, 2, 3, 5, 10, 20, 50, 75, 100, 125]
 
+type HistorySortField = 'total_return_pct' | 'win_rate' | 'profit_factor' | 'max_drawdown' | 'sharpe_ratio' | 'total_trades' | 'avg_holding_hours' | 'created_at'
+
+const HISTORY_SORT_OPTIONS: { value: HistorySortField; label: string }[] = [
+  { value: 'total_return_pct', label: '总收益率' },
+  { value: 'win_rate', label: '胜率' },
+  { value: 'profit_factor', label: '盈亏比' },
+  { value: 'max_drawdown', label: '最大回撤' },
+  { value: 'sharpe_ratio', label: '夏普比率' },
+  { value: 'total_trades', label: '总成交笔数' },
+  { value: 'avg_holding_hours', label: '平均持仓时长' },
+  { value: 'created_at', label: '创建时间' },
+]
+
+function getRecordSortValue(record: BacktestRecord, field: HistorySortField): number {
+  if (field === 'created_at') return Date.parse(record.created_at) || 0
+  return record[field]
+}
+
 export function BacktestPage() {
   const navigate = useNavigate()
   const records = useBacktestStore((state) => state.records)
@@ -288,6 +306,8 @@ export function BacktestPage() {
   const [editName, setEditName] = useState('')
   const [detailResult, setDetailResult] = useState<Result | null>(null)
   const [detailRecord, setDetailRecord] = useState<BacktestRecordDetail | null>(null)
+  const [historySortField, setHistorySortField] = useState<HistorySortField>('total_return_pct')
+  const [historySortDirection, setHistorySortDirection] = useState<'desc' | 'asc'>('desc')
 
   const handleNumberInputChange = (setter: (v: string) => void) => (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = e.target.value
@@ -352,6 +372,12 @@ export function BacktestPage() {
   }
 
   const displayResult = detailResult || result
+  const sortedRecords = [...records].sort((a, b) => {
+    const aValue = getRecordSortValue(a, historySortField)
+    const bValue = getRecordSortValue(b, historySortField)
+    if (aValue === bValue) return (Date.parse(b.created_at) || 0) - (Date.parse(a.created_at) || 0)
+    return historySortDirection === 'desc' ? bValue - aValue : aValue - bValue
+  })
 
   return (
     <MainLayout>
@@ -473,8 +499,23 @@ export function BacktestPage() {
               records.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center text-[var(--color-text-disabled)] opacity-30"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" className="mb-3"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="9" x2="15" y2="9"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="11" y2="17"/></svg><div className="text-sm font-bold uppercase tracking-widest">暂无回测记录</div></div>
               ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {records.map((r) => (
+                <div className="flex flex-col gap-4">
+                  <div className="flex flex-col gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-card)] p-4 shadow-sm sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <div className="text-[10px] font-black uppercase tracking-widest text-[var(--color-text-disabled)]">排序</div>
+                      <div className="mt-1 text-sm font-bold">默认按盈利率展示，可按各指标切换</div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <select value={historySortField} onChange={(e) => setHistorySortField(e.target.value as HistorySortField)} className="!w-auto !px-3 !py-2 text-xs font-bold">
+                        {HISTORY_SORT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                      </select>
+                      <button onClick={() => setHistorySortDirection((prev) => prev === 'desc' ? 'asc' : 'desc')} className="px-3 py-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-input)] text-[10px] font-black uppercase text-[var(--color-text-secondary)] transition-all hover:border-[var(--color-accent)] hover:text-[var(--color-accent)]">
+                        {historySortDirection === 'desc' ? '高 → 低' : '低 → 高'}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {sortedRecords.map((r) => (
                     <div key={r.id} onClick={() => handleViewDetail(r.id)} className="bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-xl p-5 hover:border-[var(--color-accent)] cursor-pointer transition-all shadow-sm group">
                       <div className="flex items-center justify-between mb-4">
                         <div className="min-w-0">{editingId === r.id ? (<input type="text" value={editName} onChange={(e) => setEditName(e.target.value)} onBlur={() => handleRename(r.id)} onKeyDown={(e) => { if (e.key === 'Enter') handleRename(r.id); if (e.key === 'Escape') setEditingId(null) }} onClick={(e) => e.stopPropagation()} autoFocus className="text-sm font-black !py-0.5 !px-1 w-full" />) : (<div className="text-sm font-black truncate group-hover:text-[var(--color-accent)] transition-colors">{r.name}</div>)}<div className="text-[10px] text-[var(--color-text-disabled)] font-bold uppercase mt-1">{r.symbol} · {r.interval} · {r.leverage}x</div></div>
@@ -483,6 +524,7 @@ export function BacktestPage() {
                       <div className="flex items-end justify-between"><div><div className="text-[10px] text-[var(--color-text-disabled)] font-bold uppercase mb-1">总收益率</div><div className={`text-xl font-black font-[var(--font-mono)] ${r.total_return_pct >= 0 ? 'text-[var(--color-long)]' : 'text-[var(--color-short)]'}`}>{r.total_return_pct > 0 ? '+' : ''}{r.total_return_pct}%</div></div><div className="text-right"><div className="text-[9px] text-[var(--color-text-disabled)] font-bold uppercase mb-1">胜率</div><div className="text-sm font-black">{r.win_rate}%</div></div></div>
                     </div>
                   ))}
+                  </div>
                 </div>
               )
             )}
