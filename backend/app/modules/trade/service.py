@@ -383,4 +383,3 @@ class TradeService:
         except Exception as e:
             print(f"[Trade] Error getting average entry price for {symbol}: {e}")
             return 0.0
-            return 0.0
