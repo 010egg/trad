@@ -74,6 +74,12 @@ export function DashboardPage() {
     ])
   }, [fetchBalance, fetchConfig, fetchPositions, fetchStatus, fetchSymbols, fetchKlines])
 
+  // 定时刷新持仓（同步最新 current_price 和 unrealized_pnl）
+  useEffect(() => {
+    const timer = setInterval(() => { void fetchPositions() }, 5000)
+    return () => clearInterval(timer)
+  }, [fetchPositions])
+
   // 加载K线数据（首次加载和 symbol/interval 变化时）
   useEffect(() => {
     const urlSymbol = searchParams.get('symbol')

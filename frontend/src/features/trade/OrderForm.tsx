@@ -57,8 +57,8 @@ export function OrderForm() {
   return (
     <div className="p-5 border-b border-[var(--color-border)] bg-gradient-to-b from-transparent to-[var(--color-bg-hover)]/10">
       <div className="flex items-center justify-between mb-4">
-        <span className="text-[10px] text-[var(--color-text-disabled)] uppercase tracking-widest font-bold">New Position</span>
-        <span className="text-[10px] text-[var(--color-text-disabled)] font-medium">Spot / Isolated</span>
+        <span className="text-[10px] text-[var(--color-text-disabled)] uppercase tracking-widest font-bold">新建仓位</span>
+        <span className="text-[10px] text-[var(--color-text-disabled)] font-medium">现货 / 逐仓</span>
       </div>
 
       {/* 方向切换 - 更加专业的切换器 */}
@@ -71,7 +71,7 @@ export function OrderForm() {
               : 'bg-transparent text-[var(--color-text-disabled)] hover:text-[var(--color-text-secondary)]'
           }`}
         >
-          BUY / LONG
+          做多 / 买入
         </button>
         <button
           onClick={() => setSide('SHORT')}
@@ -81,14 +81,14 @@ export function OrderForm() {
               : 'bg-transparent text-[var(--color-text-disabled)] hover:text-[var(--color-text-secondary)]'
           }`}
         >
-          SELL / SHORT
+          做空 / 卖出
         </button>
       </div>
 
       {/* 表单区域 */}
       <div className="space-y-3.5">
         <div className="flex items-center gap-3">
-          <label className="w-10 text-[10px] font-bold text-[var(--color-text-disabled)] uppercase shrink-0">Type</label>
+          <label className="w-10 text-[10px] font-bold text-[var(--color-text-disabled)] uppercase shrink-0">类型</label>
           <select
             value={orderType}
             onChange={(e) => setOrderType(e.target.value)}
@@ -100,7 +100,7 @@ export function OrderForm() {
         </div>
 
         <div className="flex items-center gap-3">
-          <label className="w-10 text-[10px] font-bold text-[var(--color-text-disabled)] uppercase shrink-0">Price</label>
+          <label className="w-10 text-[10px] font-bold text-[var(--color-text-disabled)] uppercase shrink-0">价格</label>
           <div className="flex-1 relative group">
             <input
               type="text"
@@ -115,7 +115,7 @@ export function OrderForm() {
         </div>
 
         <div className="flex items-center gap-3">
-          <label className="w-10 text-[10px] font-bold text-[var(--color-short)]/80 uppercase shrink-0">S/L *</label>
+          <label className="w-10 text-[10px] font-bold text-[var(--color-short)]/80 uppercase shrink-0">止损 *</label>
           <div className="flex-1 relative">
             <input
               type="text"
@@ -130,7 +130,7 @@ export function OrderForm() {
         </div>
 
         <div className="flex items-center gap-3">
-          <label className="w-10 text-[10px] font-bold text-[var(--color-text-disabled)] uppercase shrink-0">T/P</label>
+          <label className="w-10 text-[10px] font-bold text-[var(--color-text-disabled)] uppercase shrink-0">止盈</label>
           <div className="flex-1 relative">
             <input
               type="text"
@@ -144,9 +144,9 @@ export function OrderForm() {
           </div>
         </div>
 
-        {/* 交易理由 - 增加质感 */}
+        {/* 交易理由 */}
         <div className="pt-2">
-          <label className="block text-[10px] font-bold text-[var(--color-text-disabled)] uppercase mb-2 tracking-wider">Trading Rationale <span className="text-[var(--color-danger)]">*</span></label>
+          <label className="block text-[10px] font-bold text-[var(--color-text-disabled)] uppercase mb-2 tracking-wider">交易理由 <span className="text-[var(--color-danger)]">*</span></label>
           <textarea
             value={reason}
             onChange={(e) => setReason(e.target.value)}
@@ -178,7 +178,7 @@ export function OrderForm() {
             <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
           ) : (
             <>
-              {side === 'LONG' ? 'PLACE LONG ORDER' : 'PLACE SHORT ORDER'}
+              {side === 'LONG' ? '确认下单 (做多)' : '确认下单 (做空)'}
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
                 <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
               </svg>

@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import String, DateTime, Integer, Float, Text, func, ForeignKey
+from sqlalchemy import String, DateTime, Integer, Float, Text, BigInteger, func, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -34,3 +34,21 @@ class BacktestRecord(Base):
     trades: Mapped[str] = mapped_column(Text, default="[]")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class HistoricalKline(Base):
+    __tablename__ = "historical_klines"
+    __table_args__ = (
+        UniqueConstraint("symbol", "interval", "open_time", name="uq_historical_kline_symbol_interval_open_time"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(20), index=True)
+    interval: Mapped[str] = mapped_column(String(10), index=True)
+    open_time: Mapped[int] = mapped_column(BigInteger, index=True)
+    open: Mapped[float] = mapped_column(Float)
+    high: Mapped[float] = mapped_column(Float)
+    low: Mapped[float] = mapped_column(Float)
+    close: Mapped[float] = mapped_column(Float)
+    volume: Mapped[float] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

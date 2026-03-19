@@ -166,6 +166,13 @@ class TradeService:
         self, req: CreateOrderRequest, settings: TradeSettings
     ) -> Order:
         """模拟交易 - 直接标记为 FILLED"""
+        if req.price:
+            fill_price = req.price
+        else:
+            from app.modules.market.service import fetch_current_prices
+            prices = await fetch_current_prices([req.symbol])
+            fill_price = prices.get(req.symbol, 0.0)
+
         order = Order(
             user_id=self.user_id,
             symbol=req.symbol,
@@ -181,7 +188,7 @@ class TradeService:
             trade_mode="SIMULATED",
             market_type=settings.default_market,
             leverage=settings.default_leverage,
-            filled_price=Decimal(str(req.price or 0)),
+            filled_price=Decimal(str(fill_price)),
         )
         self.db.add(order)
         await self.db.commit()
