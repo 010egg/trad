@@ -1,8 +1,12 @@
 """回测引擎单元测试（不依赖 Binance API，使用模拟数据）"""
 
-import pytest
+from datetime import datetime
 
-from app.modules.backtest.engine import calc_ma, run_backtest
+import pytest
+from sqlalchemy import select
+
+from app.modules.backtest.engine import calc_ma, fetch_historical_klines, run_backtest
+from app.modules.backtest.models import HistoricalKline
 
 
 def _make_klines(prices: list[float]) -> list[dict]:
@@ -11,6 +15,25 @@ def _make_klines(prices: list[float]) -> list[dict]:
         {"time": (1700000000 + i * 900) * 1000, "open": p, "high": p * 1.005, "low": p * 0.995, "close": p, "volume": 100}
         for i, p in enumerate(prices)
     ]
+
+
+def _make_range_klines(start_ts: int, end_ts: int, interval_ms: int, base_price: float = 100.0) -> list[dict]:
+    klines = []
+    current = start_ts
+    index = 0
+    while current < end_ts:
+        price = base_price + index * 0.1
+        klines.append({
+            "time": current,
+            "open": price,
+            "high": price * 1.002,
+            "low": price * 0.998,
+            "close": price,
+            "volume": 1000,
+        })
+        current += interval_ms
+        index += 1
+    return klines
 
 
 def test_calc_ma():
@@ -141,6 +164,70 @@ def test_backtest_leverage_liquidation():
     # 高杠杆 + 宽止损，暴跌可能触发爆仓
     for trade in result["trades"]:
         assert trade["pnl_pct"] >= -100.0  # 最多亏完保证金
+
+
+@pytest.mark.asyncio
+async def test_fetch_historical_klines_uses_db_cache(db_session, monkeypatch):
+    interval_ms = 15 * 60 * 1000
+    start_ts = int(datetime.strptime("2025-01-01", "%Y-%m-%d").timestamp() * 1000)
+    end_ts = int(datetime.strptime("2025-01-02", "%Y-%m-%d").timestamp() * 1000)
+    remote_calls: list[tuple[int, int]] = []
+
+    async def mock_remote(symbol: str, interval: str, range_start: int, range_end: int):
+        remote_calls.append((range_start, range_end))
+        return _make_range_klines(range_start, range_end, interval_ms)
+
+    monkeypatch.setattr("app.modules.backtest.engine._fetch_remote_klines_range", mock_remote)
+
+    first = await fetch_historical_klines(db_session, "BTCUSDT", "15m", "2025-01-01", "2025-01-02")
+    await db_session.commit()
+    second = await fetch_historical_klines(db_session, "BTCUSDT", "15m", "2025-01-01", "2025-01-02")
+
+    cached_rows = (
+        await db_session.execute(
+            select(HistoricalKline)
+            .where(HistoricalKline.symbol == "BTCUSDT", HistoricalKline.interval == "15m")
+            .order_by(HistoricalKline.open_time)
+        )
+    ).scalars().all()
+
+    assert remote_calls == [(start_ts, end_ts)]
+    assert len(first) == len(second) == len(cached_rows) == 96
+    assert cached_rows[0].open_time == start_ts
+    assert cached_rows[-1].open_time == end_ts - interval_ms
+
+
+@pytest.mark.asyncio
+async def test_fetch_historical_klines_only_fetches_incremental_gap(db_session, monkeypatch):
+    interval_ms = 15 * 60 * 1000
+    day_1_start = int(datetime.strptime("2025-01-01", "%Y-%m-%d").timestamp() * 1000)
+    day_2_start = int(datetime.strptime("2025-01-02", "%Y-%m-%d").timestamp() * 1000)
+    day_3_start = int(datetime.strptime("2025-01-03", "%Y-%m-%d").timestamp() * 1000)
+    remote_calls: list[tuple[int, int]] = []
+
+    async def mock_remote(symbol: str, interval: str, range_start: int, range_end: int):
+        remote_calls.append((range_start, range_end))
+        return _make_range_klines(range_start, range_end, interval_ms, base_price=200.0)
+
+    monkeypatch.setattr("app.modules.backtest.engine._fetch_remote_klines_range", mock_remote)
+
+    first = await fetch_historical_klines(db_session, "BTCUSDT", "15m", "2025-01-01", "2025-01-02")
+    await db_session.commit()
+    second = await fetch_historical_klines(db_session, "BTCUSDT", "15m", "2025-01-01", "2025-01-03")
+
+    cached_rows = (
+        await db_session.execute(
+            select(HistoricalKline)
+            .where(HistoricalKline.symbol == "BTCUSDT", HistoricalKline.interval == "15m")
+            .order_by(HistoricalKline.open_time)
+        )
+    ).scalars().all()
+
+    assert len(first) == 96
+    assert len(second) == 192
+    assert remote_calls == [(day_1_start, day_2_start), (day_2_start, day_3_start)]
+    assert len(cached_rows) == 192
+    assert cached_rows[-1].open_time == day_3_start - interval_ms
 
 
 # ========== API 集成测试 ==========

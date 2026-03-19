@@ -43,7 +43,7 @@ def _auto_name(req: BacktestRequest) -> str:
 
 @router.post("/run")
 async def run(req: BacktestRequest, db: DB, user: User = Depends(get_current_user)):
-    klines = await fetch_historical_klines(req.symbol, req.interval, req.start_date, req.end_date)
+    klines = await fetch_historical_klines(db, req.symbol, req.interval, req.start_date, req.end_date)
 
     if not klines:
         return _wrap({"error": "无法获取历史数据", "trades": []})

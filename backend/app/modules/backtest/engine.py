@@ -7,18 +7,126 @@ import math
 from datetime import datetime
 
 import httpx
+import numpy as np
+import pandas as pd
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.modules.backtest.models import HistoricalKline
 
 BINANCE_BASE_URL = "https://api.binance.com"
+BINANCE_INTERVAL_MS = {
+    "1m": 60_000,
+    "3m": 3 * 60_000,
+    "5m": 5 * 60_000,
+    "15m": 15 * 60_000,
+    "30m": 30 * 60_000,
+    "1h": 60 * 60_000,
+    "2h": 2 * 60 * 60_000,
+    "4h": 4 * 60 * 60_000,
+    "6h": 6 * 60 * 60_000,
+    "8h": 8 * 60 * 60_000,
+    "12h": 12 * 60 * 60_000,
+    "1d": 24 * 60 * 60_000,
+    "3d": 3 * 24 * 60 * 60_000,
+    "1w": 7 * 24 * 60 * 60_000,
+}
 
 
 # ========== 数据获取 ==========
 
-async def fetch_historical_klines(symbol: str, interval: str, start_date: str, end_date: str) -> list[dict]:
-    """获取历史 K 线数据"""
-    start_ts = int(datetime.strptime(start_date, "%Y-%m-%d").timestamp() * 1000)
-    end_ts = int(datetime.strptime(end_date, "%Y-%m-%d").timestamp() * 1000)
+def _date_to_timestamp_ms(date_str: str) -> int:
+    return int(datetime.strptime(date_str, "%Y-%m-%d").timestamp() * 1000)
 
-    all_klines = []
+
+def _interval_to_milliseconds(interval: str) -> int:
+    if interval not in BINANCE_INTERVAL_MS:
+        raise ValueError(f"unsupported interval: {interval}")
+    return BINANCE_INTERVAL_MS[interval]
+
+
+def _series_to_optional_list(series: pd.Series, digits: int | None = None) -> list[float | None]:
+    if digits is not None:
+        series = series.round(digits)
+    return [None if pd.isna(value) else float(value) for value in series.tolist()]
+
+
+
+def _macd_params(config: dict) -> tuple[int, int, int]:
+    return (
+        int(config.get("fast_period", config.get("fast", 12))),
+        int(config.get("slow_period", config.get("slow", 26))),
+        int(config.get("signal", 9)),
+    )
+
+
+def _macd_suffix(fast: int, slow: int, signal: int) -> str:
+    return f"_{fast}_{slow}_{signal}"
+
+
+def _kline_to_dict(kline: HistoricalKline) -> dict:
+    return {
+        "time": int(kline.open_time),
+        "open": float(kline.open),
+        "high": float(kline.high),
+        "low": float(kline.low),
+        "close": float(kline.close),
+        "volume": float(kline.volume),
+    }
+
+
+async def _load_cached_klines(
+    db: AsyncSession,
+    symbol: str,
+    interval: str,
+    start_ts: int,
+    end_ts: int,
+) -> list[dict]:
+    stmt = (
+        select(HistoricalKline)
+        .where(
+            HistoricalKline.symbol == symbol,
+            HistoricalKline.interval == interval,
+            HistoricalKline.open_time >= start_ts,
+            HistoricalKline.open_time < end_ts,
+        )
+        .order_by(HistoricalKline.open_time)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    return [_kline_to_dict(row) for row in rows]
+
+
+def _find_missing_ranges(
+    cached_klines: list[dict],
+    start_ts: int,
+    end_ts: int,
+    interval_ms: int,
+) -> list[tuple[int, int]]:
+    if start_ts >= end_ts:
+        return []
+    if not cached_klines:
+        return [(start_ts, end_ts)]
+
+    missing_ranges: list[tuple[int, int]] = []
+    cursor = start_ts
+
+    for kline in cached_klines:
+        open_time = int(kline["time"])
+        if open_time > cursor:
+            missing_ranges.append((cursor, min(open_time, end_ts)))
+        cursor = max(cursor, open_time + interval_ms)
+        if cursor >= end_ts:
+            break
+
+    if cursor < end_ts:
+        missing_ranges.append((cursor, end_ts))
+
+    return [(range_start, range_end) for range_start, range_end in missing_ranges if range_start < range_end]
+
+
+async def _fetch_remote_klines_range(symbol: str, interval: str, start_ts: int, end_ts: int) -> list[dict]:
+    interval_ms = _interval_to_milliseconds(interval)
+    all_klines: list[dict] = []
     current_start = start_ts
 
     async with httpx.AsyncClient() as client:
@@ -36,173 +144,218 @@ async def fetch_historical_klines(symbol: str, interval: str, start_date: str, e
             if not raw:
                 break
 
-            for k in raw:
+            last_open_time: int | None = None
+            for row in raw:
+                open_time = int(row[0])
+                if open_time >= end_ts:
+                    break
                 all_klines.append({
-                    "time": int(k[0]),
-                    "open": float(k[1]),
-                    "high": float(k[2]),
-                    "low": float(k[3]),
-                    "close": float(k[4]),
-                    "volume": float(k[5]),
+                    "time": open_time,
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": float(row[5]),
                 })
+                last_open_time = open_time
 
-            current_start = int(raw[-1][0]) + 1
+            if last_open_time is None:
+                break
+
+            next_start = last_open_time + interval_ms
+            if next_start <= current_start:
+                break
+            current_start = next_start
 
     return all_klines
+
+
+async def _store_klines(db: AsyncSession, symbol: str, interval: str, klines: list[dict]) -> None:
+    if not klines:
+        return
+
+    deduped = sorted({int(k["time"]): k for k in klines}.values(), key=lambda item: item["time"])
+    first_open_time = int(deduped[0]["time"])
+    last_open_time = int(deduped[-1]["time"])
+
+    stmt = (
+        select(HistoricalKline.open_time)
+        .where(
+            HistoricalKline.symbol == symbol,
+            HistoricalKline.interval == interval,
+            HistoricalKline.open_time >= first_open_time,
+            HistoricalKline.open_time <= last_open_time,
+        )
+    )
+    existing_open_times = set((await db.execute(stmt)).scalars().all())
+
+    rows = [
+        HistoricalKline(
+            symbol=symbol,
+            interval=interval,
+            open_time=int(k["time"]),
+            open=float(k["open"]),
+            high=float(k["high"]),
+            low=float(k["low"]),
+            close=float(k["close"]),
+            volume=float(k["volume"]),
+        )
+        for k in deduped
+        if int(k["time"]) not in existing_open_times
+    ]
+    if rows:
+        db.add_all(rows)
+        await db.flush()
+
+
+async def fetch_historical_klines(
+    db: AsyncSession,
+    symbol: str,
+    interval: str,
+    start_date: str,
+    end_date: str,
+) -> list[dict]:
+    """优先从数据库读取历史 K 线，只对缺口做增量拉取。"""
+    symbol = symbol.upper()
+    start_ts = _date_to_timestamp_ms(start_date)
+    end_ts = _date_to_timestamp_ms(end_date)
+    if start_ts >= end_ts:
+        return []
+
+    interval_ms = _interval_to_milliseconds(interval)
+    cached_klines = await _load_cached_klines(db, symbol, interval, start_ts, end_ts)
+    missing_ranges = _find_missing_ranges(cached_klines, start_ts, end_ts, interval_ms)
+
+    if missing_ranges:
+        fetched_klines: list[dict] = []
+        for range_start, range_end in missing_ranges:
+            fetched_klines.extend(await _fetch_remote_klines_range(symbol, interval, range_start, range_end))
+        await _store_klines(db, symbol, interval, fetched_klines)
+        cached_klines = await _load_cached_klines(db, symbol, interval, start_ts, end_ts)
+
+    return cached_klines
 
 
 # ========== 技术指标计算 ==========
 
 def calc_ma(closes: list[float], period: int) -> list[float | None]:
     """简单移动平均线 (SMA)"""
-    result = []
-    for i in range(len(closes)):
-        if i < period - 1:
-            result.append(None)
-        else:
-            result.append(sum(closes[i - period + 1:i + 1]) / period)
-    return result
+    if len(closes) < period:
+        return [None] * len(closes)
+    series = pd.Series(closes, dtype="float64")
+    return _series_to_optional_list(series.rolling(window=period, min_periods=period).mean())
 
 
 def calc_ema(closes: list[float], period: int) -> list[float | None]:
     """指数移动平均线 (EMA)"""
-    result: list[float | None] = [None] * (period - 1)
-    multiplier = 2.0 / (period + 1)
-    # 初始值用 SMA
-    sma = sum(closes[:period]) / period
-    result.append(sma)
-    for i in range(period, len(closes)):
-        prev = result[-1]
-        assert prev is not None
-        ema = (closes[i] - prev) * multiplier + prev
-        result.append(ema)
-    return result
+    if len(closes) < period:
+        return [None] * len(closes)
+
+    series = pd.Series(closes, dtype="float64")
+    seeded = pd.Series(np.nan, index=series.index, dtype="float64")
+    seeded.iloc[period - 1] = float(series.iloc[:period].mean())
+    if len(series) > period:
+        seeded.iloc[period:] = series.iloc[period:]
+
+    ema = seeded.ewm(span=period, adjust=False, min_periods=1).mean()
+    ema.iloc[:period - 1] = np.nan
+    return _series_to_optional_list(ema)
 
 
 def calc_rsi(closes: list[float], period: int = 14) -> list[float | None]:
     """相对强弱指标 (RSI)"""
-    result: list[float | None] = [None] * period
-    gains = []
-    losses = []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
+    if len(closes) <= period:
+        return [None] * len(closes)
 
+    close_array = np.asarray(closes, dtype=float)
+    diffs = np.diff(close_array)
+    gains = np.where(diffs > 0, diffs, 0.0)
+    losses = np.where(diffs < 0, -diffs, 0.0)
     if len(gains) < period:
         return [None] * len(closes)
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-
-    if avg_loss == 0:
-        result.append(100.0)
-    else:
-        rs = avg_gain / avg_loss
-        result.append(100 - 100 / (1 + rs))
+    result = np.full(len(closes), np.nan)
+    avg_gain = float(gains[:period].mean())
+    avg_loss = float(losses[:period].mean())
+    result[period] = 100.0 if avg_loss == 0 else 100 - 100 / (1 + avg_gain / avg_loss)
 
     for i in range(period, len(gains)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        if avg_loss == 0:
-            result.append(100.0)
-        else:
-            rs = avg_gain / avg_loss
-            result.append(100 - 100 / (1 + rs))
+        result[i + 1] = 100.0 if avg_loss == 0 else 100 - 100 / (1 + avg_gain / avg_loss)
 
-    return result
+    return _series_to_optional_list(pd.Series(result, dtype="float64"))
 
 
 def calc_kdj(highs: list[float], lows: list[float], closes: list[float], n: int = 9, m1: int = 3, m2: int = 3) -> tuple[list[float | None], list[float | None], list[float | None]]:
     """KDJ 随机指标"""
-    k_values: list[float | None] = []
-    d_values: list[float | None] = []
-    j_values: list[float | None] = []
+    high_series = pd.Series(highs, dtype="float64")
+    low_series = pd.Series(lows, dtype="float64")
+    close_series = pd.Series(closes, dtype="float64")
+    highest = high_series.rolling(window=n, min_periods=n).max()
+    lowest = low_series.rolling(window=n, min_periods=n).min()
+    denominator = highest - lowest
+    rsv = ((close_series - lowest) / denominator * 100).where(denominator != 0, 50.0)
+
+    k_values = np.full(len(closes), np.nan)
+    d_values = np.full(len(closes), np.nan)
+    j_values = np.full(len(closes), np.nan)
     prev_k = 50.0
     prev_d = 50.0
 
-    for i in range(len(closes)):
-        if i < n - 1:
-            k_values.append(None)
-            d_values.append(None)
-            j_values.append(None)
+    for i, rsv_value in enumerate(rsv.to_numpy()):
+        if np.isnan(rsv_value):
             continue
-
-        highest = max(highs[i - n + 1:i + 1])
-        lowest = min(lows[i - n + 1:i + 1])
-
-        if highest == lowest:
-            rsv = 50.0
-        else:
-            rsv = (closes[i] - lowest) / (highest - lowest) * 100
-
-        k = (m1 - 1) / m1 * prev_k + 1 / m1 * rsv
+        k = (m1 - 1) / m1 * prev_k + 1 / m1 * float(rsv_value)
         d = (m2 - 1) / m2 * prev_d + 1 / m2 * k
         j = 3 * k - 2 * d
 
-        k_values.append(round(k, 2))
-        d_values.append(round(d, 2))
-        j_values.append(round(j, 2))
+        k_values[i] = round(k, 2)
+        d_values[i] = round(d, 2)
+        j_values[i] = round(j, 2)
         prev_k = k
         prev_d = d
 
-    return k_values, d_values, j_values
+    return (
+        _series_to_optional_list(pd.Series(k_values, dtype="float64")),
+        _series_to_optional_list(pd.Series(d_values, dtype="float64")),
+        _series_to_optional_list(pd.Series(j_values, dtype="float64")),
+    )
 
 
 def calc_macd(closes: list[float], fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[list[float | None], list[float | None], list[float | None]]:
     """MACD 指标，返回 (DIF, DEA, MACD柱)"""
-    ema_fast = calc_ema(closes, fast)
-    ema_slow = calc_ema(closes, slow)
+    ema_fast = pd.Series(calc_ema(closes, fast), dtype="float64")
+    ema_slow = pd.Series(calc_ema(closes, slow), dtype="float64")
+    dif_series = ema_fast - ema_slow
+    dif = _series_to_optional_list(dif_series)
 
-    dif: list[float | None] = []
-    for i in range(len(closes)):
-        if ema_fast[i] is None or ema_slow[i] is None:
-            dif.append(None)
-        else:
-            dif.append(ema_fast[i] - ema_slow[i])
-
-    # DEA = EMA(DIF, signal)
-    dif_values = [v for v in dif if v is not None]
+    dif_values = [value for value in dif if value is not None]
     if len(dif_values) < signal:
         return dif, [None] * len(closes), [None] * len(closes)
 
     dea_raw = calc_ema(dif_values, signal)
-    # 对齐回原始长度
     offset = len(closes) - len(dif_values)
-    dea: list[float | None] = [None] * offset
-    dea.extend(dea_raw)
-
-    macd_hist: list[float | None] = []
-    for i in range(len(closes)):
-        if dif[i] is not None and dea[i] is not None:
-            macd_hist.append(round((dif[i] - dea[i]) * 2, 4))
-        else:
-            macd_hist.append(None)
+    dea: list[float | None] = [None] * offset + dea_raw
+    hist_series = (pd.Series(dif, dtype="float64") - pd.Series(dea, dtype="float64")) * 2
+    macd_hist = _series_to_optional_list(hist_series, digits=4)
 
     return dif, dea, macd_hist
 
 
 def calc_boll(closes: list[float], period: int = 20, std_dev: float = 2.0) -> tuple[list[float | None], list[float | None], list[float | None]]:
     """布林带 (BOLL)，返回 (上轨, 中轨, 下轨)"""
-    upper: list[float | None] = []
-    middle: list[float | None] = []
-    lower: list[float | None] = []
+    close_series = pd.Series(closes, dtype="float64")
+    middle_series = close_series.rolling(window=period, min_periods=period).mean()
+    std_series = close_series.rolling(window=period, min_periods=period).std(ddof=0)
+    upper_series = middle_series + std_dev * std_series
+    lower_series = middle_series - std_dev * std_series
 
-    for i in range(len(closes)):
-        if i < period - 1:
-            upper.append(None)
-            middle.append(None)
-            lower.append(None)
-        else:
-            window = closes[i - period + 1:i + 1]
-            ma = sum(window) / period
-            variance = sum((x - ma) ** 2 for x in window) / period
-            std = math.sqrt(variance)
-            middle.append(round(ma, 2))
-            upper.append(round(ma + std_dev * std, 2))
-            lower.append(round(ma - std_dev * std, 2))
-
-    return upper, middle, lower
+    return (
+        _series_to_optional_list(upper_series, digits=2),
+        _series_to_optional_list(middle_series, digits=2),
+        _series_to_optional_list(lower_series, digits=2),
+    )
 
 
 # ========== 指标计算 API（供前端图表使用） ==========
@@ -252,13 +405,12 @@ def calc_indicators(klines: list[dict], indicators: list[dict]) -> dict:
             result["KDJ_J"] = [{"time": times[i], "value": j[i]} for i in range(len(times)) if j[i] is not None]
 
         elif t == "MACD":
-            fast = ind.get("fast", 12)
-            slow = ind.get("slow", 26)
-            signal = ind.get("signal", 9)
+            fast, slow, signal = _macd_params(ind)
             dif, dea, hist = calc_macd(closes, fast, slow, signal)
-            result["MACD_DIF"] = [{"time": times[i], "value": round(dif[i], 4)} for i in range(len(times)) if dif[i] is not None]
-            result["MACD_DEA"] = [{"time": times[i], "value": round(dea[i], 4)} for i in range(len(times)) if dea[i] is not None]
-            result["MACD_HIST"] = [{"time": times[i], "value": hist[i]} for i in range(len(times)) if hist[i] is not None]
+            suffix = "" if (fast, slow, signal) == (12, 26, 9) else _macd_suffix(fast, slow, signal)
+            result[f"MACD_DIF{suffix}"] = [{"time": times[i], "value": round(dif[i], 4)} for i in range(len(times)) if dif[i] is not None]
+            result[f"MACD_DEA{suffix}"] = [{"time": times[i], "value": round(dea[i], 4)} for i in range(len(times)) if dea[i] is not None]
+            result[f"MACD_HIST{suffix}"] = [{"time": times[i], "value": hist[i]} for i in range(len(times)) if hist[i] is not None]
 
         elif t == "BOLL":
             period = ind.get("period", 20)
@@ -329,8 +481,10 @@ def evaluate_condition(cond: dict, indicators: dict, i: int) -> bool:
             return _cross_below(a, b, i)
 
     elif t == "MACD":
-        dif = indicators.get("MACD_DIF", [])
-        dea = indicators.get("MACD_DEA", [])
+        fast, slow, signal = _macd_params(cond)
+        suffix = _macd_suffix(fast, slow, signal)
+        dif = indicators.get(f"MACD_DIF{suffix}") or indicators.get("MACD_DIF", [])
+        dea = indicators.get(f"MACD_DEA{suffix}") or indicators.get("MACD_DEA", [])
         if not dif or not dea or i >= len(dif) or i >= len(dea):
             return False
         if op == "cross_above":
@@ -786,7 +940,7 @@ def _precompute_indicators(closes, highs, lows, conditions):
         elif t == "KDJ":
             needed.add(("KDJ", c.get("n", 9)))
         elif t == "MACD":
-            needed.add(("MACD", 0))
+            needed.add(("MACD", _macd_params(c)))
         elif t == "RSI":
             needed.add(("RSI", c.get("period", 14)))
         elif t == "BOLL":
@@ -803,10 +957,16 @@ def _precompute_indicators(closes, highs, lows, conditions):
             data["KDJ_D"] = d
             data["KDJ_J"] = j
         elif indicator_type == "MACD":
-            dif, dea, hist = calc_macd(closes)
-            data["MACD_DIF"] = dif
-            data["MACD_DEA"] = dea
-            data["MACD_HIST"] = hist
+            fast, slow, signal = param
+            dif, dea, hist = calc_macd(closes, fast, slow, signal)
+            suffix = _macd_suffix(fast, slow, signal)
+            data[f"MACD_DIF{suffix}"] = dif
+            data[f"MACD_DEA{suffix}"] = dea
+            data[f"MACD_HIST{suffix}"] = hist
+            if (fast, slow, signal) == (12, 26, 9):
+                data["MACD_DIF"] = dif
+                data["MACD_DEA"] = dea
+                data["MACD_HIST"] = hist
         elif indicator_type == "RSI":
             data[f"RSI{param}"] = calc_rsi(closes, param)
         elif indicator_type == "BOLL":

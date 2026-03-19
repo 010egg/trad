@@ -39,6 +39,12 @@ async def client():
         yield ac
 
 
+@pytest_asyncio.fixture
+async def db_session():
+    async with TestSession() as session:
+        yield session
+
+
 @pytest.fixture(scope="session")
 def event_loop():
     loop = asyncio.new_event_loop()
