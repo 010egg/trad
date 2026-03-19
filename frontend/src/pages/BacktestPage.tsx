@@ -92,10 +92,6 @@ function formatAssetAmount(value: number, asset: string | null, digits: number =
   return `${signed && value > 0 ? '+' : ''}${formatNumber(value, digits)} ${asset || 'quote_asset'}`
 }
 
-function escapeMarkdownCell(value: string | number): string {
-  return String(value).replace(/\|/g, '\\|').replace(/\n/g, ' ')
-}
-
 function toPrettyJson(value: unknown): string {
   return JSON.stringify(value, null, 2)
 }
@@ -138,6 +134,7 @@ function buildAiRecord(detail: BacktestRecordDetail, entryConditions: StoredCond
   return {
     schema_version: 'backtest_record_export_v3',
     export_purpose: 'ai_readable_backtest_record',
+    exported_at: new Date().toLocaleString('zh-CN', { hour12: false }),
     record: {
       id: detail.id,
       name: detail.name,
@@ -146,12 +143,15 @@ function buildAiRecord(detail: BacktestRecordDetail, entryConditions: StoredCond
       interval: detail.interval,
       start_date: detail.start_date,
       end_date: detail.end_date,
-      leverage: formatMultiplier(detail.leverage),
-      stop_loss_pct: formatPercent(detail.stop_loss_pct),
-      take_profit_pct: formatPercent(detail.take_profit_pct),
-      risk_per_trade: formatPercent(detail.risk_per_trade),
-      initial_balance: formatAssetAmount(detail.initial_balance, quoteAsset, 2),
-      final_balance: formatAssetAmount(detail.final_balance, quoteAsset, 2),
+      strategy_parameters: {
+        leverage: formatMultiplier(detail.leverage),
+        stop_loss_pct: formatPercent(detail.stop_loss_pct),
+        take_profit_pct: formatPercent(detail.take_profit_pct),
+      },
+      balances: {
+        initial_balance: formatAssetAmount(detail.initial_balance, quoteAsset, 2),
+        final_balance: formatAssetAmount(detail.final_balance, quoteAsset, 2),
+      },
       metrics: {
         total_return_pct: formatPercent(detail.total_return_pct, 2, true),
         win_rate: formatPercent(detail.win_rate, 1),
@@ -175,60 +175,10 @@ function buildBacktestMarkdown(detail: BacktestRecordDetail): string {
   const entryConditions = parseJsonArray<StoredCondition>(detail.entry_conditions)
   const exitConditions = parseJsonArray<StoredCondition>(detail.exit_conditions)
   const trades = parseJsonArray<Trade>(detail.trades)
-  const quoteAsset = detectQuoteAsset(detail.symbol)
   const aiRecord = buildAiRecord(detail, entryConditions, exitConditions, trades)
 
   return [
     `# ${detail.name}`,
-    '',
-    '## 导出信息',
-    `- exported_at: ${new Date().toLocaleString('zh-CN', { hour12: false })}`,
-    `- record_id: ${detail.id}`,
-    '',
-    '## record_fields',
-    '| field | value |',
-    '| --- | --- |',
-    `| id | ${escapeMarkdownCell(detail.id)} |`,
-    `| name | ${escapeMarkdownCell(detail.name)} |`,
-    `| symbol | ${escapeMarkdownCell(detail.symbol)} |`,
-    `| quote_asset | ${escapeMarkdownCell(quoteAsset || 'quote_asset')} |`,
-    `| interval | ${escapeMarkdownCell(detail.interval)} |`,
-    `| start_date | ${escapeMarkdownCell(detail.start_date)} |`,
-    `| end_date | ${escapeMarkdownCell(detail.end_date)} |`,
-    `| leverage | ${formatMultiplier(detail.leverage)} |`,
-    `| initial_balance | ${formatAssetAmount(detail.initial_balance, quoteAsset, 2)} |`,
-    `| stop_loss_pct | ${formatPercent(detail.stop_loss_pct)} |`,
-    `| take_profit_pct | ${formatPercent(detail.take_profit_pct)} |`,
-    `| risk_per_trade | ${formatPercent(detail.risk_per_trade)} |`,
-    `| total_return_pct | ${formatPercent(detail.total_return_pct, 2, true)} |`,
-    `| final_balance | ${formatAssetAmount(detail.final_balance, quoteAsset, 2)} |`,
-    `| win_rate | ${formatPercent(detail.win_rate, 1)} |`,
-    `| profit_factor | ${formatMultiplier(detail.profit_factor, 2)} |`,
-    `| max_drawdown | ${formatPercent(detail.max_drawdown)} |`,
-    `| sharpe_ratio | ${formatNumber(detail.sharpe_ratio)} |`,
-    `| total_trades | ${detail.total_trades} |`,
-    `| avg_holding_hours | ${formatHours(detail.avg_holding_hours, 1)} |`,
-    `| created_at | ${escapeMarkdownCell(detail.created_at)} |`,
-    '',
-    '## entry_conditions',
-    '```json',
-    toPrettyJson(entryConditions),
-    '```',
-    '',
-    '## exit_conditions',
-    '```json',
-    toPrettyJson(exitConditions),
-    '```',
-    '',
-    '## trades_table',
-    trades.length === 0 ? '- []' : '| # | side | entry_time | exit_time | entry_price | exit_price | pnl | pnl_pct | duration |',
-    trades.length === 0 ? '' : '| --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- |',
-    ...trades.map((trade, index) => `| ${index + 1} | ${escapeMarkdownCell(trade.side)} | ${escapeMarkdownCell(trade.entry_time)} | ${escapeMarkdownCell(trade.exit_time)} | ${formatAssetAmount(trade.entry_price, quoteAsset, 2)} | ${formatAssetAmount(trade.exit_price, quoteAsset, 2)} | ${formatAssetAmount(trade.pnl, quoteAsset, 2, true)} | ${formatPercent(trade.pnl_pct, 2, true)} | ${escapeMarkdownCell(trade.duration)} |`),
-    '',
-    '## trades_json',
-    '```json',
-    toPrettyJson(trades),
-    '```',
     '',
     '## record_json',
     '```json',
