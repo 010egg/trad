@@ -58,6 +58,7 @@ class BacktestRequest(BaseModel):
     leverage: int = 1
     strategy_mode: str = "long_only"  # long_only, short_only, bidirectional
     name: str | None = None
+    include_trades: bool = True  # False 时跳过返回交易列表，减少响应体积
     # 兼容旧接口
     entry_indicator: str | None = None
     entry_fast: int | None = None
@@ -140,3 +141,15 @@ class BacktestRecordDetail(BacktestRecordResponse):
 
 class BacktestRecordUpdate(BaseModel):
     name: str
+
+
+class BatchBacktestRequest(BaseModel):
+    runs: list[BacktestRequest]
+
+
+class AvailableDataItem(BaseModel):
+    symbol: str
+    interval: str
+    count: int
+    start_date: str  # 最早K线日期 YYYY-MM-DD
+    end_date: str    # 最新K线日期 YYYY-MM-DD

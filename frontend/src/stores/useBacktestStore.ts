@@ -9,10 +9,12 @@ export interface BacktestRecord {
   start_date: string
   end_date: string
   leverage: number
+  initial_balance: number
   stop_loss_pct: number
   take_profit_pct: number
   risk_per_trade: number
-  total_return: number
+  total_return_pct: number
+  final_balance: number
   win_rate: number
   profit_factor: number
   max_drawdown: number

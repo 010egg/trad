@@ -554,8 +554,9 @@ def run_backtest(
     risk_per_trade: float = 2.0,
     leverage: int = 1,
     strategy_mode: str = "long_only",  # long_only, short_only, bidirectional
-    long_entry_conditions: list[list[dict]] | None = None,  # 做多入场条件
-    short_entry_conditions: list[list[dict]] | None = None,  # 做空入场条件
+    long_entry_conditions: list[list[dict]] | None = None,
+    short_entry_conditions: list[list[dict]] | None = None,
+    include_trades: bool = True,
     # 兼容旧接口
     fast_period: int | None = None,
     slow_period: int | None = None,
@@ -606,13 +607,15 @@ def run_backtest(
     if strategy_mode == "bidirectional":
         return _run_bidirectional_backtest(
             klines, indicator_data, long_entry_conditions, short_entry_conditions,
-            stop_loss_pct, take_profit_pct, initial_balance, risk_per_trade, leverage
+            stop_loss_pct, take_profit_pct, initial_balance, risk_per_trade, leverage,
+            include_trades=include_trades,
         )
     else:
         return _run_unidirectional_backtest(
             klines, indicator_data, entry_conditions, exit_conditions,
             stop_loss_pct, take_profit_pct, initial_balance, risk_per_trade, leverage,
-            side="LONG" if strategy_mode == "long_only" else "SHORT"
+            side="LONG" if strategy_mode == "long_only" else "SHORT",
+            include_trades=include_trades,
         )
 
 
@@ -641,7 +644,8 @@ def _calculate_margin_base(
 
 def _run_unidirectional_backtest(
     klines, indicator_data, entry_conditions, exit_conditions,
-    stop_loss_pct, take_profit_pct, initial_balance, risk_per_trade, leverage, side
+    stop_loss_pct, take_profit_pct, initial_balance, risk_per_trade, leverage, side,
+    include_trades: bool = True,
 ):
     """单向交易回测（仅做多或仅做空）"""
     trades = []
@@ -712,12 +716,13 @@ def _run_unidirectional_backtest(
                     max_drawdown = dd
                 in_position = False
 
-    return _calc_stats(trades, balance, initial_balance, max_drawdown)
+    return _calc_stats(trades, balance, initial_balance, max_drawdown, include_trades)
 
 
 def _run_bidirectional_backtest(
     klines, indicator_data, long_entry_conditions, short_entry_conditions,
-    stop_loss_pct, take_profit_pct, initial_balance, risk_per_trade, leverage
+    stop_loss_pct, take_profit_pct, initial_balance, risk_per_trade, leverage,
+    include_trades: bool = True,
 ):
     """
     双向交易回测（震荡策略）
@@ -874,7 +879,7 @@ def _run_bidirectional_backtest(
                     max_drawdown = dd
                 short_position = None
 
-    return _calc_stats(trades, balance, initial_balance, max_drawdown)
+    return _calc_stats(trades, balance, initial_balance, max_drawdown, include_trades)
 
 
 def _check_boll_middle_cross(indicator_data, current_price, i):
@@ -1005,7 +1010,7 @@ def _empty_result(initial_balance: float = 10000.0):
     }
 
 
-def _calc_stats(trades, balance, initial_balance, max_drawdown):
+def _calc_stats(trades, balance, initial_balance, max_drawdown, include_trades: bool = True):
     if not trades:
         return _empty_result(initial_balance)
 
@@ -1027,5 +1032,5 @@ def _calc_stats(trades, balance, initial_balance, max_drawdown):
         "sharpe_ratio": round(avg_return / std_return, 2) if std_return > 0 else 0,
         "total_trades": len(trades),
         "avg_holding_hours": round(sum(float(t["duration"].rstrip("h")) for t in trades) / len(trades), 1),
-        "trades": trades,
+        "trades": trades if include_trades else [],
     }

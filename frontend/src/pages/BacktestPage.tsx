@@ -11,23 +11,36 @@ interface Trade {
 }
 
 interface Result {
-  total_return: number; win_rate: number; profit_factor: number;
+  total_return_pct: number; win_rate: number; profit_factor: number;
   max_drawdown: number; sharpe_ratio: number; total_trades: number;
   avg_holding_hours: number; trades: Trade[]; record_id?: string;
+  final_balance?: number;
+}
+
+interface StoredCondition {
+  type?: string
+  op?: string
+  fast?: number
+  slow?: number
+  n?: number
+  line?: string
+  target_line?: string
+  period?: number
+  value?: number
+  fast_period?: number
+  slow_period?: number
+  signal?: number
 }
 
 interface Condition {
   id: number
   type: string
   op: string
-  // MA/EMA
   fast?: number
   slow?: number
-  // KDJ
   n?: number
   line?: string
   target_line?: string
-  // RSI/BOLL
   period?: number
   value?: number
 }
@@ -50,6 +63,201 @@ const OP_OPTIONS: Record<string, { value: string; label: string }[]> = {
   BOLL: [{ value: 'touch_lower', label: '触及下轨' }, { value: 'touch_upper', label: '触及上轨' }],
 }
 
+function parseJsonArray<T>(raw: string): T[] {
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    return Array.isArray(parsed) ? (parsed as T[]) : []
+  } catch {
+    return []
+  }
+}
+
+function formatNumber(value: number, digits: number = 2): string {
+  return Number.isFinite(value) ? value.toFixed(digits) : '--'
+}
+
+function formatPercent(value: number, digits: number = 2): string {
+  return `${value > 0 ? '+' : ''}${formatNumber(value, digits)}%`
+}
+
+function escapeMarkdownCell(value: string | number): string {
+  return String(value).replace(/\|/g, '\\|').replace(/\n/g, ' ')
+}
+
+function toPrettyJson(value: unknown): string {
+  return JSON.stringify(value, null, 2)
+}
+
+function sanitizeFileName(value: string): string {
+  return value
+    .trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 80) || 'backtest'
+}
+
+function detectQuoteAsset(symbol: string): string | null {
+  const knownQuoteAssets = ['USDT', 'USDC', 'BUSD', 'FDUSD', 'BTC', 'ETH', 'BNB']
+  return knownQuoteAssets.find((asset) => symbol.endsWith(asset)) || null
+}
+
+function parseDurationHours(duration: string): number | null {
+  const parsed = Number(duration.replace(/h$/i, ''))
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function buildAiRecord(detail: BacktestRecordDetail, entryConditions: StoredCondition[], exitConditions: StoredCondition[], trades: Trade[]) {
+  const quoteAsset = detectQuoteAsset(detail.symbol)
+  const normalizedTrades = trades.map((trade, index) => ({
+    index: index + 1,
+    side: trade.side,
+    entry_time: trade.entry_time,
+    exit_time: trade.exit_time,
+    entry_price: trade.entry_price,
+    exit_price: trade.exit_price,
+    price_unit: quoteAsset ? `${quoteAsset}_per_base_asset` : 'quote_asset_price',
+    pnl_amount: trade.pnl,
+    pnl_amount_unit: quoteAsset || 'quote_asset',
+    pnl_pct: trade.pnl_pct,
+    pnl_pct_unit: 'percent',
+    pnl_pct_basis: 'backtest_engine_reported_trade_return',
+    duration_hours: parseDurationHours(trade.duration),
+    duration_original: trade.duration,
+  }))
+
+  return {
+    schema_version: 'backtest_record_export_v2',
+    export_purpose: 'ai_readable_backtest_record',
+    units_guide: {
+      leverage_x: 'multiple',
+      stop_loss_price_move_pct: 'percent_of_underlying_price_move',
+      take_profit_price_move_pct: 'percent_of_underlying_price_move',
+      risk_per_trade_equity_pct: 'percent_of_account_equity',
+      total_return_pct: 'percent_of_initial_balance',
+      win_rate_pct: 'percent_of_closed_trades',
+      profit_factor_ratio: 'ratio',
+      max_drawdown_pct: 'percent_of_equity_peak',
+      sharpe_ratio: 'dimensionless',
+      avg_holding_hours: 'hours',
+      account_balance_unit: quoteAsset || 'quote_asset',
+      trade_price_unit: quoteAsset ? `${quoteAsset}_per_base_asset` : 'quote_asset_price',
+      trade_pnl_amount_unit: quoteAsset || 'quote_asset',
+      trade_pnl_pct_unit: 'percent',
+    },
+    record: {
+      id: detail.id,
+      name: detail.name,
+      symbol: detail.symbol,
+      quote_asset: quoteAsset,
+      interval: detail.interval,
+      start_date: detail.start_date,
+      end_date: detail.end_date,
+      leverage_x: detail.leverage,
+      stop_loss_price_move_pct: detail.stop_loss_pct,
+      take_profit_price_move_pct: detail.take_profit_pct,
+      risk_per_trade_equity_pct: detail.risk_per_trade,
+      initial_balance_amount: detail.initial_balance,
+      final_balance_amount: detail.final_balance,
+      metrics: {
+        total_return_pct: detail.total_return_pct,
+        win_rate_pct: detail.win_rate,
+        profit_factor_ratio: detail.profit_factor,
+        max_drawdown_pct: detail.max_drawdown,
+        sharpe_ratio: detail.sharpe_ratio,
+        total_trades_count: detail.total_trades,
+        avg_holding_hours: detail.avg_holding_hours,
+      },
+      strategy_conditions: {
+        entry_conditions: entryConditions,
+        exit_conditions: exitConditions,
+      },
+      trades: normalizedTrades,
+      created_at: detail.created_at,
+    },
+  }
+}
+
+function buildBacktestMarkdown(detail: BacktestRecordDetail): string {
+  const entryConditions = parseJsonArray<StoredCondition>(detail.entry_conditions)
+  const exitConditions = parseJsonArray<StoredCondition>(detail.exit_conditions)
+  const trades = parseJsonArray<Trade>(detail.trades)
+  const quoteAsset = detectQuoteAsset(detail.symbol)
+  const aiRecord = buildAiRecord(detail, entryConditions, exitConditions, trades)
+
+  return [
+    `# ${detail.name}`,
+    '',
+    '## 导出信息',
+    `- exported_at: ${new Date().toLocaleString('zh-CN', { hour12: false })}`,
+    `- record_id: ${detail.id}`,
+    '',
+    '## record_fields',
+    '| field | value | unit |',
+    '| --- | --- | --- |',
+    `| id | ${escapeMarkdownCell(detail.id)} | string |`,
+    `| name | ${escapeMarkdownCell(detail.name)} | string |`,
+    `| symbol | ${escapeMarkdownCell(detail.symbol)} | trading_symbol |`,
+    `| interval | ${escapeMarkdownCell(detail.interval)} | kline_interval |`,
+    `| start_date | ${escapeMarkdownCell(detail.start_date)} | calendar_date |`,
+    `| end_date | ${escapeMarkdownCell(detail.end_date)} | calendar_date |`,
+    `| leverage | ${detail.leverage} | x |`,
+    `| initial_balance | ${formatNumber(detail.initial_balance)} | ${quoteAsset || 'quote_asset'} |`,
+    `| stop_loss_pct | ${formatNumber(detail.stop_loss_pct)} | percent_of_underlying_price_move |`,
+    `| take_profit_pct | ${formatNumber(detail.take_profit_pct)} | percent_of_underlying_price_move |`,
+    `| risk_per_trade | ${formatNumber(detail.risk_per_trade)} | percent_of_account_equity |`,
+    `| total_return_pct | ${formatPercent(detail.total_return_pct)} | percent_of_initial_balance |`,
+    `| final_balance | ${formatNumber(detail.final_balance)} | ${quoteAsset || 'quote_asset'} |`,
+    `| win_rate | ${formatNumber(detail.win_rate, 1)}% | percent_of_closed_trades |`,
+    `| profit_factor | ${formatNumber(detail.profit_factor)}x | ratio |`,
+    `| max_drawdown | ${formatNumber(detail.max_drawdown)}% | percent_of_equity_peak |`,
+    `| sharpe_ratio | ${formatNumber(detail.sharpe_ratio)} | dimensionless |`,
+    `| total_trades | ${detail.total_trades} | count |`,
+    `| avg_holding_hours | ${formatNumber(detail.avg_holding_hours, 1)}h | hours |`,
+    `| created_at | ${escapeMarkdownCell(detail.created_at)} | datetime_string |`,
+    '',
+    '## entry_conditions',
+    '```json',
+    toPrettyJson(entryConditions),
+    '```',
+    '',
+    '## exit_conditions',
+    '```json',
+    toPrettyJson(exitConditions),
+    '```',
+    '',
+    '## trades_table',
+    trades.length === 0 ? '- []' : '| # | side | entry_time | exit_time | entry_price | exit_price | pnl | pnl_pct | duration |',
+    trades.length === 0 ? '' : '| --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- |',
+    ...trades.map((trade, index) => `| ${index + 1} | ${escapeMarkdownCell(trade.side)} | ${escapeMarkdownCell(trade.entry_time)} | ${escapeMarkdownCell(trade.exit_time)} | ${formatNumber(trade.entry_price)} | ${formatNumber(trade.exit_price)} | ${formatNumber(trade.pnl)} | ${formatPercent(trade.pnl_pct)} | ${escapeMarkdownCell(trade.duration)} |`),
+    '',
+    '## trades_json',
+    '```json',
+    toPrettyJson(trades),
+    '```',
+    '',
+    '## record_json',
+    '```json',
+    toPrettyJson(aiRecord),
+    '```',
+  ].filter(Boolean).join('\n')
+}
+
+function downloadMarkdown(detail: BacktestRecordDetail): void {
+  const markdown = buildBacktestMarkdown(detail)
+  const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' })
+  const url = window.URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+
+  anchor.href = url
+  anchor.download = `${sanitizeFileName(`${detail.name || detail.symbol}-${detail.start_date}-${detail.end_date}`)}.md`
+  document.body.append(anchor)
+  anchor.click()
+  anchor.remove()
+  window.URL.revokeObjectURL(url)
+}
+
 let nextId = 1
 function newCondition(type: string = 'MA'): Condition {
   const base: Condition = { id: nextId++, type, op: OP_OPTIONS[type]?.[0]?.value || 'cross_above' }
@@ -61,117 +269,45 @@ function newCondition(type: string = 'MA'): Condition {
 }
 
 function ConditionEditor({ cond, onChange, onRemove }: { cond: Condition; onChange: (c: Condition) => void; onRemove: () => void }) {
-  const handleTypeChange = (type: string) => {
-    onChange(newCondition(type))
-  }
-
+  const handleTypeChange = (type: string) => onChange(newCondition(type))
   return (
     <div className="bg-[var(--color-bg-input)] rounded-lg p-3 mb-2">
       <div className="flex items-center justify-between mb-2">
-        <select value={cond.type} onChange={(e) => handleTypeChange(e.target.value)}
-          className="!w-auto !px-2 !py-1 text-sm font-semibold">
+        <select value={cond.type} onChange={(e) => handleTypeChange(e.target.value)} className="!w-auto !px-2 !py-1 text-sm font-semibold">
           {CONDITION_TYPES.map((ct) => <option key={ct.value} value={ct.value}>{ct.label}</option>)}
         </select>
-        <button onClick={onRemove}
-          className="text-xs px-2 py-1 rounded border-none bg-transparent text-[var(--color-text-disabled)] hover:text-[var(--color-short)] cursor-pointer">
-          x
-        </button>
+        <button onClick={onRemove} className="text-xs px-2 py-1 rounded border-none bg-transparent text-[var(--color-text-disabled)] hover:text-[var(--color-short)] cursor-pointer">x</button>
       </div>
-
       <div className="flex flex-col gap-2">
-        {/* 操作类型 */}
-        <select value={cond.op} onChange={(e) => onChange({ ...cond, op: e.target.value })}
-          className="!px-2 !py-1 text-xs">
+        <select value={cond.op} onChange={(e) => onChange({ ...cond, op: e.target.value })} className="!px-2 !py-1 text-xs">
           {(OP_OPTIONS[cond.type] || []).map((op) => <option key={op.value} value={op.value}>{op.label}</option>)}
         </select>
-
-        {/* MA/EMA 参数 */}
         {(cond.type === 'MA' || cond.type === 'EMA') && (
           <div className="flex gap-2 items-center text-xs">
             <span className="text-[var(--color-text-secondary)]">快线</span>
-            <input
-              type="text"
-              inputMode="numeric"
-              value={cond.fast ?? ''}
-              onChange={(e) => {
-                const v = e.target.value;
-                if (v === '' || /^\d+$/.test(v)) onChange({ ...cond, fast: v === '' ? undefined : +v })
-              }}
-              className="!w-16 !px-2 !py-1 text-xs font-[var(--font-mono)]"
-            />
+            <input type="text" inputMode="numeric" value={cond.fast ?? ''} onChange={(e) => { const v = e.target.value; if (v === '' || /^\d+$/.test(v)) onChange({ ...cond, fast: v === '' ? undefined : +v }) }} className="!w-16 !px-2 !py-1 text-xs font-[var(--font-mono)]" />
             <span className="text-[var(--color-text-secondary)]">慢线</span>
-            <input
-              type="text"
-              inputMode="numeric"
-              value={cond.slow ?? ''}
-              onChange={(e) => {
-                const v = e.target.value;
-                if (v === '' || /^\d+$/.test(v)) onChange({ ...cond, slow: v === '' ? undefined : +v })
-              }}
-              className="!w-16 !px-2 !py-1 text-xs font-[var(--font-mono)]"
-            />
+            <input type="text" inputMode="numeric" value={cond.slow ?? ''} onChange={(e) => { const v = e.target.value; if (v === '' || /^\d+$/.test(v)) onChange({ ...cond, slow: v === '' ? undefined : +v }) }} className="!w-16 !px-2 !py-1 text-xs font-[var(--font-mono)]" />
           </div>
         )}
-
-        {/* KDJ 参数 */}
         {cond.type === 'KDJ' && (
           <div className="flex gap-2 items-center text-xs">
             <span className="text-[var(--color-text-secondary)]">N周期</span>
-            <input
-              type="text"
-              inputMode="numeric"
-              value={cond.n ?? ''}
-              onChange={(e) => {
-                const v = e.target.value;
-                if (v === '' || /^\d+$/.test(v)) onChange({ ...cond, n: v === '' ? undefined : +v })
-              }}
-              className="!w-16 !px-2 !py-1 text-xs font-[var(--font-mono)]"
-            />
+            <input type="text" inputMode="numeric" value={cond.n ?? ''} onChange={(e) => { const v = e.target.value; if (v === '' || /^\d+$/.test(v)) onChange({ ...cond, n: v === '' ? undefined : +v }) }} className="!w-16 !px-2 !py-1 text-xs font-[var(--font-mono)]" />
           </div>
         )}
-
-        {/* RSI 参数 */}
         {cond.type === 'RSI' && (
           <div className="flex gap-2 items-center text-xs">
             <span className="text-[var(--color-text-secondary)]">周期</span>
-            <input
-              type="text"
-              inputMode="numeric"
-              value={cond.period ?? ''}
-              onChange={(e) => {
-                const v = e.target.value;
-                if (v === '' || /^\d+$/.test(v)) onChange({ ...cond, period: v === '' ? undefined : +v })
-              }}
-              className="!w-16 !px-2 !py-1 text-xs font-[var(--font-mono)]"
-            />
+            <input type="text" inputMode="numeric" value={cond.period ?? ''} onChange={(e) => { const v = e.target.value; if (v === '' || /^\d+$/.test(v)) onChange({ ...cond, period: v === '' ? undefined : +v }) }} className="!w-16 !px-2 !py-1 text-xs font-[var(--font-mono)]" />
             <span className="text-[var(--color-text-secondary)]">阈值</span>
-            <input
-              type="text"
-              inputMode="numeric"
-              value={cond.value ?? ''}
-              onChange={(e) => {
-                const v = e.target.value;
-                if (v === '' || /^\d+$/.test(v)) onChange({ ...cond, value: v === '' ? undefined : +v })
-              }}
-              className="!w-16 !px-2 !py-1 text-xs font-[var(--font-mono)]"
-            />
+            <input type="text" inputMode="numeric" value={cond.value ?? ''} onChange={(e) => { const v = e.target.value; if (v === '' || /^\d+$/.test(v)) onChange({ ...cond, value: v === '' ? undefined : +v }) }} className="!w-16 !px-2 !py-1 text-xs font-[var(--font-mono)]" />
           </div>
         )}
-
-        {/* BOLL 参数 */}
         {cond.type === 'BOLL' && (
           <div className="flex gap-2 items-center text-xs">
             <span className="text-[var(--color-text-secondary)]">周期</span>
-            <input
-              type="text"
-              inputMode="numeric"
-              value={cond.period ?? ''}
-              onChange={(e) => {
-                const v = e.target.value;
-                if (v === '' || /^\d+$/.test(v)) onChange({ ...cond, period: v === '' ? undefined : +v })
-              }}
-              className="!w-16 !px-2 !py-1 text-xs font-[var(--font-mono)]"
-            />
+            <input type="text" inputMode="numeric" value={cond.period ?? ''} onChange={(e) => { const v = e.target.value; if (v === '' || /^\d+$/.test(v)) onChange({ ...cond, period: v === '' ? undefined : +v }) }} className="!w-16 !px-2 !py-1 text-xs font-[var(--font-mono)]" />
           </div>
         )}
       </div>
@@ -201,7 +337,7 @@ export function BacktestPage() {
   const [result, setResult] = useState<Result | null>(null)
   const [strategyMode, setStrategyMode] = useState<'long_only' | 'short_only' | 'bidirectional'>('long_only')
   const [entryConditions, setEntryConditions] = useState<Condition[]>([newCondition('MA')])
-  const [exitConditions, setExitConditions] = useState<Condition[]>([])
+  const [exitConditions] = useState<Condition[]>([])
   const [longEntryConditions, setLongEntryConditions] = useState<Condition[]>([newCondition('BOLL')])
   const [shortEntryConditions, setShortEntryConditions] = useState<Condition[]>([{ ...newCondition('BOLL'), op: 'touch_upper' }])
   const [activeTab, setActiveTab] = useState<'result' | 'history'>('result')
@@ -212,14 +348,10 @@ export function BacktestPage() {
 
   const handleNumberInputChange = (setter: (v: string) => void) => (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = e.target.value
-    if (val === '' || /^\d*\.?\d*$/.test(val)) {
-      setter(val)
-    }
+    if (val === '' || /^\d*\.?\d*$/.test(val)) setter(val)
   }
 
-  useEffect(() => {
-    void fetchRecords()
-  }, [fetchRecords])
+  useEffect(() => { void fetchRecords() }, [fetchRecords])
 
   const condToApi = (cond: Condition) => {
     const obj: Record<string, unknown> = { type: cond.type, op: cond.op }
@@ -236,83 +368,43 @@ export function BacktestPage() {
   const runBacktest = async () => {
     setLoading(true)
     try {
-      const payload: any = {
-        symbol,
-        interval,
-        start_date: startDate,
-        end_date: endDate,
-        strategy_mode: strategyMode,
-        stop_loss_pct: parseFloat(sl) || 0,
-        take_profit_pct: parseFloat(tp) || 0,
-        leverage,
-        name: strategyName || undefined,
-      }
-
-      if (strategyMode === 'bidirectional') {
-        payload.long_entry_conditions = longEntryConditions.map(condToApi)
-        payload.short_entry_conditions = shortEntryConditions.map(condToApi)
-      } else {
-        payload.entry_conditions = entryConditions.map(condToApi)
-        payload.exit_conditions = exitConditions.map(condToApi)
-      }
-
+      const payload: any = { symbol, interval, start_date: startDate, end_date: endDate, strategy_mode: strategyMode, stop_loss_pct: parseFloat(sl) || 0, take_profit_pct: parseFloat(tp) || 0, leverage, name: strategyName || undefined }
+      if (strategyMode === 'bidirectional') { payload.long_entry_conditions = longEntryConditions.map(condToApi); payload.short_entry_conditions = shortEntryConditions.map(condToApi) }
+      else { payload.entry_conditions = entryConditions.map(condToApi); payload.exit_conditions = exitConditions.map(condToApi) }
       const resultData: Result = await api.post('/backtest/run', payload)
-      setResult(resultData)
-      setActiveTab('result')
-      setDetailResult(null)
-      setDetailRecord(null)
-      void fetchRecords()
-    } catch { /* ignore */ }
+      setResult(resultData); setActiveTab('result'); setDetailResult(null); setDetailRecord(null); void fetchRecords()
+    } catch {}
     setLoading(false)
   }
 
-  const updateEntry = (i: number, c: Condition) => {
-    setEntryConditions((prev) => prev.map((p, idx) => idx === i ? { ...c, id: p.id } : p))
-  }
-  const updateExit = (i: number, c: Condition) => {
-    setExitConditions((prev) => prev.map((p, idx) => idx === i ? { ...c, id: p.id } : p))
-  }
-  const updateLongEntry = (i: number, c: Condition) => {
-    setLongEntryConditions((prev) => prev.map((p, idx) => idx === i ? { ...c, id: p.id } : p))
-  }
-  const updateShortEntry = (i: number, c: Condition) => {
-    setShortEntryConditions((prev) => prev.map((p, idx) => idx === i ? { ...c, id: p.id } : p))
-  }
+  const updateEntry = (i: number, c: Condition) => setEntryConditions((prev) => prev.map((p, idx) => idx === i ? { ...c, id: p.id } : p))
+  const updateLongEntry = (i: number, c: Condition) => setLongEntryConditions((prev) => prev.map((p, idx) => idx === i ? { ...c, id: p.id } : p))
+  const updateShortEntry = (i: number, c: Condition) => setShortEntryConditions((prev) => prev.map((p, idx) => idx === i ? { ...c, id: p.id } : p))
 
   const handleViewDetail = async (id: string) => {
     const detail = await getRecord(id)
     setDetailRecord(detail)
-    setDetailResult({
-      total_return: detail.total_return,
-      win_rate: detail.win_rate,
-      profit_factor: detail.profit_factor,
-      max_drawdown: detail.max_drawdown,
-      sharpe_ratio: detail.sharpe_ratio,
-      total_trades: detail.total_trades,
-      avg_holding_hours: detail.avg_holding_hours,
-      trades: JSON.parse(detail.trades),
-      record_id: detail.id,
-    })
+    setDetailResult({ total_return_pct: detail.total_return_pct, win_rate: detail.win_rate, profit_factor: detail.profit_factor, max_drawdown: detail.max_drawdown, sharpe_ratio: detail.sharpe_ratio, total_trades: detail.total_trades, avg_holding_hours: detail.avg_holding_hours, trades: JSON.parse(detail.trades), record_id: detail.id, final_balance: detail.final_balance })
     setActiveTab('result')
   }
 
-  const handleRename = async (id: string) => {
-    if (!editName.trim()) return
-    await updateRecord(id, { name: editName.trim() })
-    setEditingId(null)
-  }
+  const handleRename = async (id: string) => { if (!editName.trim()) return; await updateRecord(id, { name: editName.trim() }); setEditingId(null) }
 
   const handleApplyToDashboard = async (record: any) => {
     try {
-      const detail = await getRecord(record.id)
-      const trades = JSON.parse(detail.trades)
+      const detail = await getRecord(record.id); const trades = JSON.parse(detail.trades)
       if (!Array.isArray(trades) || trades.length === 0) return
       setSignals(trades, record.id, record.name, record.symbol, record.interval)
-      setTimeout(() => {
-        navigate(`/?symbol=${record.symbol}&interval=${record.interval}&t=${Date.now()}`)
-      }, 300)
+      setTimeout(() => { navigate(`/?symbol=${record.symbol}&interval=${record.interval}&t=${Date.now()}`) }, 300)
+    } catch (error) { console.error('Failed to apply signals to dashboard:', error) }
+  }
+
+  const handleExportMarkdown = async (recordId: string) => {
+    try {
+      const detail = detailRecord?.id === recordId ? detailRecord : await getRecord(recordId)
+      downloadMarkdown(detail)
     } catch (error) {
-      console.error('Failed to apply signals to dashboard:', error)
+      console.error('Failed to export markdown:', error)
     }
   }
 
@@ -321,266 +413,112 @@ export function BacktestPage() {
   return (
     <MainLayout>
       <div className="flex h-full bg-[var(--color-bg-primary)]">
-        {/* 左侧配置 */}
         <div className="w-[380px] bg-[var(--color-bg-card)] border-r border-[var(--color-border)] overflow-y-auto flex flex-col custom-scrollbar">
           <div className="p-4 border-b border-[var(--color-border)]">
             <div className="text-sm font-bold mb-4 flex items-center gap-2">
-              <span className="w-1.5 h-4 bg-[var(--color-accent)] rounded-full"></span>
-              基础策略配置
+              <span className="w-1.5 h-4 bg-[var(--color-accent)] rounded-full"></span>基础策略配置
             </div>
             <div className="space-y-4">
-              <div>
-                <label className="block text-[10px] font-bold text-[var(--color-text-disabled)] uppercase mb-1.5">Strategy Name</label>
-                <input type="text" value={strategyName} onChange={(e) => setStrategyName(e.target.value)}
-                  placeholder="留空自动生成名称" className="w-full text-sm font-medium" />
-              </div>
-              <div>
-                <label className="block text-[10px] font-bold text-[var(--color-text-disabled)] uppercase mb-1.5">Mode</label>
+              <div><label className="block text-[10px] font-bold text-[var(--color-text-disabled)] uppercase mb-1.5">策略名称</label>
+                <input type="text" value={strategyName} onChange={(e) => setStrategyName(e.target.value)} placeholder="留空自动生成" className="w-full text-sm font-medium" /></div>
+              <div><label className="block text-[10px] font-bold text-[var(--color-text-disabled)] uppercase mb-1.5">交易模式</label>
                 <select value={strategyMode} onChange={(e) => setStrategyMode(e.target.value as any)} className="w-full font-bold">
-                  <option value="long_only">仅做多 / Long Only</option>
-                  <option value="short_only">仅做空 / Short Only</option>
-                  <option value="bidirectional">双向自动 / Bi-directional</option>
-                </select>
-              </div>
+                  <option value="long_only">仅做多 (Long Only)</option><option value="short_only">仅做空 (Short Only)</option><option value="bidirectional">双向自动 (Bi-directional)</option>
+                </select></div>
               <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-[10px] font-bold text-[var(--color-text-disabled)] uppercase mb-1.5">Symbol</label>
-                  <select value={symbol} onChange={(e) => setSymbol(e.target.value)} className="w-full font-bold">
-                    <option>BTCUSDT</option><option>ETHUSDT</option><option>SOLUSDT</option>
-                    <option>BNBUSDT</option><option>XRPUSDT</option><option>DOGEUSDT</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-[10px] font-bold text-[var(--color-text-disabled)] uppercase mb-1.5">Timeframe</label>
-                  <select value={interval} onChange={(e) => setInterval(e.target.value)} className="w-full font-bold">
-                    <option value="1m">1m</option><option value="5m">5m</option>
-                    <option value="15m">15m</option><option value="1h">1h</option>
-                    <option value="4h">4h</option><option value="1d">1d</option>
-                  </select>
-                </div>
+                <div><label className="block text-[10px] font-bold text-[var(--color-text-disabled)] uppercase mb-1.5">交易对</label>
+                  <select value={symbol} onChange={(e) => setSymbol(e.target.value)} className="w-full font-bold"><option>BTCUSDT</option><option>ETHUSDT</option><option>SOLUSDT</option><option>BNBUSDT</option><option>XRPUSDT</option><option>DOGEUSDT</option></select></div>
+                <div><label className="block text-[10px] font-bold text-[var(--color-text-disabled)] uppercase mb-1.5">K线周期</label>
+                  <select value={interval} onChange={(e) => setInterval(e.target.value)} className="w-full font-bold"><option value="1m">1m</option><option value="5m">5m</option><option value="15m">15m</option><option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option></select></div>
               </div>
-              <div>
-                <label className="block text-[10px] font-bold text-[var(--color-text-disabled)] uppercase mb-1.5">Date Range</label>
-                <div className="flex gap-2 items-center">
-                  <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} className="flex-1 font-[var(--font-mono)] text-xs font-bold" />
-                  <span className="text-[var(--color-text-disabled)]">-</span>
-                  <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} className="flex-1 font-[var(--font-mono)] text-xs font-bold" />
-                </div>
-              </div>
-              <div>
-                <label className="block text-[10px] font-bold text-[var(--color-text-disabled)] uppercase mb-1.5">Leverage</label>
-                <div className="flex items-center gap-3">
-                  <input type="range" min={1} max={125} value={leverage} onChange={(e) => setLeverage(+e.target.value)}
-                    className="flex-1 h-1 accent-[var(--color-accent)]" />
-                  <span className="text-sm font-black font-[var(--font-mono)] text-[var(--color-accent)] min-w-[32px]">{leverage}x</span>
-                </div>
-                <div className="flex gap-1 mt-2 flex-wrap">
-                  {LEVERAGE_PRESETS.map((v) => (
-                    <button key={v} onClick={() => setLeverage(v)}
-                      className={`text-[10px] px-1.5 py-0.5 rounded border transition-all font-bold ${
-                        leverage === v ? 'bg-[var(--color-accent)] text-white border-[var(--color-accent)]' : 'bg-transparent text-[var(--color-text-disabled)] border-[var(--color-border)] hover:text-[var(--color-text-primary)]'
-                      }`}>
-                      {v}x
-                    </button>
-                  ))}
-                </div>
-              </div>
+              <div><label className="block text-[10px] font-bold text-[var(--color-text-disabled)] uppercase mb-1.5">时间范围</label>
+                <div className="flex gap-2 items-center"><input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} className="flex-1 font-[var(--font-mono)] text-xs font-bold" /><span className="text-[var(--color-text-disabled)]">-</span><input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} className="flex-1 font-[var(--font-mono)] text-xs font-bold" /></div></div>
+              <div><label className="block text-[10px] font-bold text-[var(--color-text-disabled)] uppercase mb-1.5">杠杆倍数</label>
+                <div className="flex items-center gap-3"><input type="range" min={1} max={125} value={leverage} onChange={(e) => setLeverage(+e.target.value)} className="flex-1 h-1 accent-[var(--color-accent)]" /><span className="text-sm font-black font-[var(--font-mono)] text-[var(--color-accent)] min-w-[32px]">{leverage}x</span></div>
+                <div className="flex gap-1 mt-2 flex-wrap">{LEVERAGE_PRESETS.map((v) => <button key={v} onClick={() => setLeverage(v)} className={`text-[10px] px-1.5 py-0.5 rounded border transition-all font-bold ${leverage === v ? 'bg-[var(--color-accent)] text-white border-[var(--color-accent)]' : 'bg-transparent text-[var(--color-text-disabled)] border-[var(--color-border)] hover:text-[var(--color-text-primary)]'}`}>{v}x</button>)}</div></div>
             </div>
           </div>
-
-          {/* 条件编辑器部分 */}
           <div className="flex-1 overflow-y-auto">
             {strategyMode !== 'bidirectional' ? (
-              <>
-                <div className="p-4 border-b border-[var(--color-border)]">
-                  <div className="flex items-center justify-between mb-4">
-                    <span className="text-[10px] font-bold text-[var(--color-long)] uppercase tracking-widest">Entry Conditions</span>
-                    <button onClick={() => setEntryConditions((prev) => [...prev, newCondition()])}
-                      className="text-[10px] px-2 py-0.5 rounded-full border border-[var(--color-long)] text-[var(--color-long)] hover:bg-[var(--color-long)] hover:text-white transition-all font-bold">
-                      + ADD
-                    </button>
-                  </div>
-                  <div className="space-y-2">
-                    {entryConditions.map((cond, i) => (
-                      <ConditionEditor key={cond.id} cond={cond} onChange={(c) => updateEntry(i, c)} onRemove={() => setEntryConditions((prev) => prev.filter((_, idx) => idx !== i))} />
-                    ))}
-                  </div>
+              <><div className="p-4 border-b border-[var(--color-border)]">
+                  <div className="flex items-center justify-between mb-4"><span className="text-[10px] font-bold text-[var(--color-long)] uppercase tracking-widest">入场条件 (Entry)</span><button onClick={() => setEntryConditions((prev) => [...prev, newCondition()])} className="text-[10px] px-2 py-0.5 rounded-full border border-[var(--color-long)] text-[var(--color-long)] hover:bg-[var(--color-long)] hover:text-white transition-all font-bold">+ 添加</button></div>
+                  <div className="space-y-2">{entryConditions.map((cond, i) => <ConditionEditor key={cond.id} cond={cond} onChange={(c) => updateEntry(i, c)} onRemove={() => setEntryConditions((prev) => prev.filter((_, idx) => idx !== i))} />)}</div>
                 </div>
                 <div className="p-4 border-b border-[var(--color-border)] bg-[var(--color-bg-hover)]/20">
-                  <div className="text-[10px] font-bold text-[var(--color-short)] uppercase tracking-widest mb-4">Risk & Exit</div>
+                  <div className="text-[10px] font-bold text-[var(--color-short)] uppercase tracking-widest mb-4">风险与止盈止损</div>
                   <div className="bg-[var(--color-bg-input)]/50 border border-[var(--color-border)] rounded-lg p-3 space-y-3">
-                    <div className="flex items-center justify-between">
-                      <label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">Stop Loss</label>
-                      <div className="flex items-center gap-1.5">
-                        <input type="text" inputMode="decimal" value={sl} onChange={handleNumberInputChange(setSl)}
-                          className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" />
-                        <span className="text-[10px] font-bold text-[var(--color-text-disabled)]">%</span>
-                      </div>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">Take Profit</label>
-                      <div className="flex items-center gap-1.5">
-                        <input type="text" inputMode="decimal" value={tp} onChange={handleNumberInputChange(setTp)}
-                          className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" />
-                        <span className="text-[10px] font-bold text-[var(--color-text-disabled)]">%</span>
-                      </div>
-                    </div>
+                    <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">止损百分比</label><div className="flex items-center gap-1.5"><input type="text" inputMode="decimal" value={sl} onChange={handleNumberInputChange(setSl)} className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" /><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">%</span></div></div>
+                    <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">止盈百分比</label><div className="flex items-center gap-1.5"><input type="text" inputMode="decimal" value={tp} onChange={handleNumberInputChange(setTp)} className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" /><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">%</span></div></div>
                   </div>
-                </div>
-              </>
+                </div></>
             ) : (
-              <>
-                <div className="p-4 border-b border-[var(--color-border)]">
-                  <div className="flex items-center justify-between mb-4 text-[var(--color-long)]">
-                    <span className="text-[10px] font-bold uppercase tracking-widest flex items-center gap-1.5">
-                      <span className="w-1.5 h-1.5 rounded-full bg-[var(--color-long)] animate-pulse"></span>
-                      Long Entry
-                    </span>
-                    <button onClick={() => setLongEntryConditions((prev) => [...prev, newCondition('BOLL')])}
-                      className="text-[10px] px-2 py-0.5 rounded-full border border-current hover:bg-[var(--color-long)] hover:text-white transition-all font-bold">
-                      + ADD
-                    </button>
-                  </div>
-                  <div className="space-y-2">
-                    {longEntryConditions.map((cond, i) => (
-                      <ConditionEditor key={cond.id} cond={cond} onChange={(c) => updateLongEntry(i, c)} onRemove={() => setLongEntryConditions((prev) => prev.filter((_, idx) => idx !== i))} />
-                    ))}
-                  </div>
+              <><div className="p-4 border-b border-[var(--color-border)]">
+                  <div className="flex items-center justify-between mb-4 text-[var(--color-long)]"><span className="text-[10px] font-bold uppercase tracking-widest flex items-center gap-1.5"><span className="w-1.5 h-1.5 rounded-full bg-[var(--color-long)] animate-pulse"></span>做多条件</span><button onClick={() => setLongEntryConditions((prev) => [...prev, newCondition('BOLL')])} className="text-[10px] px-2 py-0.5 rounded-full border border-current hover:bg-[var(--color-long)] hover:text-white transition-all font-bold">+ 添加</button></div>
+                  <div className="space-y-2">{longEntryConditions.map((cond, i) => <ConditionEditor key={cond.id} cond={cond} onChange={(c) => updateLongEntry(i, c)} onRemove={() => setLongEntryConditions((prev) => prev.filter((_, idx) => idx !== i))} />)}</div>
                 </div>
                 <div className="p-4 border-b border-[var(--color-border)]">
-                  <div className="flex items-center justify-between mb-4 text-[var(--color-short)]">
-                    <span className="text-[10px] font-bold uppercase tracking-widest flex items-center gap-1.5">
-                      <span className="w-1.5 h-1.5 rounded-full bg-[var(--color-short)] animate-pulse"></span>
-                      Short Entry
-                    </span>
-                    <button onClick={() => setShortEntryConditions((prev) => [...prev, { ...newCondition('BOLL'), op: 'touch_upper' }])}
-                      className="text-[10px] px-2 py-0.5 rounded-full border border-current hover:bg-[var(--color-short)] hover:text-white transition-all font-bold">
-                      + ADD
-                    </button>
-                  </div>
-                  <div className="space-y-2">
-                    {shortEntryConditions.map((cond, i) => (
-                      <ConditionEditor key={cond.id} cond={cond} onChange={(c) => updateShortEntry(i, c)} onRemove={() => setShortEntryConditions((prev) => prev.filter((_, idx) => idx !== i))} />
-                    ))}
-                  </div>
+                  <div className="flex items-center justify-between mb-4 text-[var(--color-short)]"><span className="text-[10px] font-bold uppercase tracking-widest flex items-center gap-1.5"><span className="w-1.5 h-1.5 rounded-full bg-[var(--color-short)] animate-pulse"></span>做空条件</span><button onClick={() => setShortEntryConditions((prev) => [...prev, { ...newCondition('BOLL'), op: 'touch_upper' }])} className="text-[10px] px-2 py-0.5 rounded-full border border-current hover:bg-[var(--color-short)] hover:text-white transition-all font-bold">+ 添加</button></div>
+                  <div className="space-y-2">{shortEntryConditions.map((cond, i) => <ConditionEditor key={cond.id} cond={cond} onChange={(c) => updateShortEntry(i, c)} onRemove={() => setShortEntryConditions((prev) => prev.filter((_, idx) => idx !== i))} />)}</div>
                 </div>
                 <div className="p-4 border-b border-[var(--color-border)] bg-[var(--color-bg-hover)]/20">
-                  <div className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase tracking-widest mb-4">Common Risk Control</div>
+                  <div className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase tracking-widest mb-4">通用风控配置</div>
                   <div className="bg-[var(--color-bg-input)]/50 border border-[var(--color-border)] rounded-lg p-3 space-y-3">
-                    <div className="flex items-center justify-between">
-                      <label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">Stop Loss</label>
-                      <div className="flex items-center gap-1.5">
-                        <input type="text" inputMode="decimal" value={sl} onChange={handleNumberInputChange(setSl)}
-                          className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" />
-                        <span className="text-[10px] font-bold text-[var(--color-text-disabled)]">%</span>
-                      </div>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">Take Profit</label>
-                      <div className="flex items-center gap-1.5">
-                        <input type="text" inputMode="decimal" value={tp} onChange={handleNumberInputChange(setTp)}
-                          className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" />
-                        <span className="text-[10px] font-bold text-[var(--color-text-disabled)]">%</span>
-                      </div>
-                    </div>
+                    <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">止损百分比</label><div className="flex items-center gap-1.5"><input type="text" inputMode="decimal" value={sl} onChange={handleNumberInputChange(setSl)} className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" /><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">%</span></div></div>
+                    <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">止盈百分比</label><div className="flex items-center gap-1.5"><input type="text" inputMode="decimal" value={tp} onChange={handleNumberInputChange(setTp)} className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" /><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">%</span></div></div>
                   </div>
-                </div>
-              </>
+                </div></>
             )}
           </div>
-
-          <div className="p-5 mt-auto">
-            <button onClick={runBacktest}
-              disabled={loading || (strategyMode === 'bidirectional' ? longEntryConditions.length === 0 || shortEntryConditions.length === 0 : entryConditions.length === 0)}
-              className="w-full py-3.5 bg-[var(--color-accent)] text-white rounded-lg font-black text-sm tracking-widest cursor-pointer hover:shadow-lg hover:shadow-[var(--color-accent)]/20 active:translate-y-[1px] transition-all disabled:opacity-30 disabled:translate-y-0 border-none">
-              {loading ? 'PROCESSING...' : 'RUN BACKTEST'}
-            </button>
-          </div>
+          <div className="p-5 mt-auto"><button onClick={runBacktest} disabled={loading || (strategyMode === 'bidirectional' ? longEntryConditions.length === 0 || shortEntryConditions.length === 0 : entryConditions.length === 0)} className="w-full py-3.5 bg-[var(--color-accent)] text-white rounded-lg font-black text-sm tracking-widest cursor-pointer hover:shadow-lg hover:shadow-[var(--color-accent)]/20 active:translate-y-[1px] transition-all disabled:opacity-30 disabled:translate-y-0 border-none">{loading ? '正在回测...' : '开始回测'}</button></div>
         </div>
 
-        {/* 右侧结果 */}
         <div className="flex-1 overflow-y-auto flex flex-col bg-[var(--color-bg-primary)]">
           <div className="flex border-b border-[var(--color-border)] bg-[var(--color-bg-card)] shrink-0 px-2">
-            <button onClick={() => { setActiveTab('result'); setDetailResult(null); setDetailRecord(null) }}
-              className={`px-5 py-3 text-[10px] font-black tracking-widest uppercase border-none cursor-pointer transition-all ${activeTab === 'result' ? 'text-[var(--color-accent)] border-b-2 border-[var(--color-accent)] bg-transparent' : 'text-[var(--color-text-disabled)] bg-transparent hover:text-[var(--color-text-secondary)]'}`}>
-              Current Result
-            </button>
-            <button onClick={() => setActiveTab('history')}
-              className={`px-5 py-3 text-[10px] font-black tracking-widest uppercase border-none cursor-pointer transition-all ${activeTab === 'history' ? 'text-[var(--color-accent)] border-b-2 border-[var(--color-accent)] bg-transparent' : 'text-[var(--color-text-disabled)] bg-transparent hover:text-[var(--color-text-secondary)]'}`}>
-              History Logs
-              {records.length > 0 && <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded-full bg-[var(--color-bg-input)]">{records.length}</span>}
-            </button>
+            <button onClick={() => { setActiveTab('result'); setDetailResult(null); setDetailRecord(null) }} className={`px-5 py-3 text-[10px] font-black tracking-widest uppercase border-none cursor-pointer transition-all ${activeTab === 'result' ? 'text-[var(--color-accent)] border-b-2 border-[var(--color-accent)] bg-transparent' : 'text-[var(--color-text-disabled)] bg-transparent hover:text-[var(--color-text-secondary)]'}`}>本次回测结果</button>
+            <button onClick={() => setActiveTab('history')} className={`px-5 py-3 text-[10px] font-black tracking-widest uppercase border-none cursor-pointer transition-all ${activeTab === 'history' ? 'text-[var(--color-accent)] border-b-2 border-[var(--color-accent)] bg-transparent' : 'text-[var(--color-text-disabled)] bg-transparent hover:text-[var(--color-text-secondary)]'}`}>历史回测记录{records.length > 0 && <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded-full bg-[var(--color-bg-input)]">{records.length}</span>}</button>
           </div>
-
           <div className="flex-1 overflow-y-auto custom-scrollbar p-6">
-            {activeTab === 'result' ? (
-              !displayResult ? (
-                <div className="h-full flex flex-col items-center justify-center text-[var(--color-text-disabled)] opacity-30">
-                  <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" className="mb-4"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 21v-5h5"/></svg>
-                  <div className="text-sm font-bold uppercase tracking-widest">Configure & Run to see performance</div>
-                </div>
+            {activeTab === 'result' ? (!displayResult ? (
+                <div className="h-full flex flex-col items-center justify-center text-[var(--color-text-disabled)] opacity-30"><svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" className="mb-4"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 21v-5h5"/></svg><div className="text-sm font-bold uppercase tracking-widest">配置策略并运行以查看表现</div></div>
               ) : (
                 <div className="flex flex-col gap-8 max-w-[1200px] mx-auto w-full">
                   {detailRecord && (
                     <div className="flex items-center justify-between p-4 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-xl shadow-sm">
                       <div className="flex items-center gap-3">
-                        <button onClick={() => { setDetailResult(null); setDetailRecord(null); setActiveTab('history') }}
-                          className="p-1.5 rounded-full hover:bg-[var(--color-bg-input)] transition-all"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="m15 18-6-6 6-6"/></svg></button>
-                        <div>
-                          <div className="text-sm font-black">{detailRecord.name}</div>
-                          <div className="text-[10px] text-[var(--color-text-disabled)] font-bold uppercase">{detailRecord.symbol} · {detailRecord.interval} · {detailRecord.leverage}x</div>
-                        </div>
+                        <button onClick={() => { setDetailResult(null); setDetailRecord(null); setActiveTab('history') }} className="p-1.5 rounded-full hover:bg-[var(--color-bg-input)] transition-all"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="m15 18-6-6 6-6"/></svg></button>
+                        <div><div className="text-sm font-black">{detailRecord.name}</div><div className="text-[10px] text-[var(--color-text-disabled)] font-bold uppercase">{detailRecord.symbol} · {detailRecord.interval} · {detailRecord.leverage}x</div></div>
                       </div>
-                      <button onClick={() => handleApplyToDashboard({ id: detailRecord.id, name: detailRecord.name, symbol: detailRecord.symbol, interval: detailRecord.interval })}
-                        className="px-4 py-2 rounded-lg bg-[var(--color-accent)]/10 text-[var(--color-accent)] border border-[var(--color-accent)]/30 text-[10px] font-black uppercase hover:bg-[var(--color-accent)] hover:text-white transition-all">Apply to Dashboard</button>
+                      <div className="flex items-center gap-2">
+                        <button onClick={() => { void handleExportMarkdown(detailRecord.id) }} className="px-4 py-2 rounded-lg bg-[var(--color-bg-input)] text-[var(--color-text-primary)] border border-[var(--color-border)] text-[10px] font-black uppercase hover:border-[var(--color-accent)] hover:text-[var(--color-accent)] transition-all">导出 MD</button>
+                        <button onClick={() => handleApplyToDashboard({ id: detailRecord.id, name: detailRecord.name, symbol: detailRecord.symbol, interval: detailRecord.interval })} className="px-4 py-2 rounded-lg bg-[var(--color-accent)]/10 text-[var(--color-accent)] border border-[var(--color-accent)]/30 text-[10px] font-black uppercase hover:bg-[var(--color-accent)] hover:text-white transition-all">应用到行情看板</button>
+                      </div>
+                    </div>
+                  )}
+                  {!detailRecord && displayResult.record_id && (
+                    <div className="flex justify-end">
+                      <button onClick={() => { void handleExportMarkdown(displayResult.record_id as string) }} className="px-4 py-2 rounded-lg bg-[var(--color-bg-card)] text-[var(--color-text-primary)] border border-[var(--color-border)] text-[10px] font-black uppercase hover:border-[var(--color-accent)] hover:text-[var(--color-accent)] transition-all">导出当前结果 MD</button>
                     </div>
                   )}
                   <div className="grid grid-cols-2 lg:grid-cols-3 gap-5">
                     {[
-                      { label: 'Total Return', value: `${displayResult.total_return > 0 ? '+' : ''}${displayResult.total_return}%`, color: displayResult.total_return >= 0 ? 'var(--color-long)' : 'var(--color-short)' },
-                      { label: 'Win Rate', value: `${displayResult.win_rate}%`, color: 'var(--color-text-primary)' },
-                      { label: 'Profit Factor', value: `${displayResult.profit_factor}x`, color: 'var(--color-accent)' },
-                      { label: 'Max Drawdown', value: `-${displayResult.max_drawdown}%`, color: 'var(--color-short)' },
-                      { label: 'Sharpe Ratio', value: `${displayResult.sharpe_ratio}`, color: 'var(--color-text-primary)' },
-                      { label: 'Total Trades', value: `${displayResult.total_trades}`, color: 'var(--color-text-primary)' },
+                      { label: '总收益率', value: `${displayResult.total_return_pct > 0 ? '+' : ''}${displayResult.total_return_pct}%`, color: displayResult.total_return_pct >= 0 ? 'var(--color-long)' : 'var(--color-short)' },
+                      { label: '胜率', value: `${displayResult.win_rate}%`, color: 'var(--color-text-primary)' },
+                      { label: '盈亏比', value: `${displayResult.profit_factor}x`, color: 'var(--color-accent)' },
+                      { label: '最大回撤', value: `-${displayResult.max_drawdown}%`, color: 'var(--color-short)' },
+                      { label: '夏普比率', value: `${displayResult.sharpe_ratio}`, color: 'var(--color-text-primary)' },
+                      { label: '总成交笔数', value: `${displayResult.total_trades}`, color: 'var(--color-text-primary)' },
                     ].map((s) => (
-                      <div key={s.label} className="bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-xl p-5 shadow-sm hover:translate-y-[-2px] transition-all">
-                        <div className="text-[10px] text-[var(--color-text-disabled)] uppercase tracking-widest font-bold mb-2">{s.label}</div>
-                        <div className="text-3xl font-black font-[var(--font-mono)] tracking-tighter" style={{ color: s.color }}>{s.value}</div>
-                      </div>
+                      <div key={s.label} className="bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-xl p-5 shadow-sm hover:translate-y-[-2px] transition-all"><div className="text-[10px] text-[var(--color-text-disabled)] uppercase tracking-widest font-bold mb-2">{s.label}</div><div className="text-3xl font-black font-[var(--font-mono)] tracking-tighter" style={{ color: s.color }}>{s.value}</div></div>
                     ))}
                   </div>
                   <div className="bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-xl overflow-hidden shadow-sm">
-                    <div className="px-5 py-4 border-b border-[var(--color-border)] bg-[var(--color-bg-hover)]/30 flex items-center justify-between">
-                      <span className="text-[10px] font-black uppercase tracking-widest">Trade Execution History</span>
-                      <span className="text-[10px] font-bold text-[var(--color-text-disabled)]">{displayResult.trades.length} Positions</span>
-                    </div>
+                    <div className="px-5 py-4 border-b border-[var(--color-border)] bg-[var(--color-bg-hover)]/30 flex items-center justify-between"><span className="text-[10px] font-black uppercase tracking-widest">历史交易执行明细</span><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">{displayResult.trades.length} 个仓位</span></div>
                     <div className="overflow-x-auto">
                       <table className="w-full text-left">
-                        <thead>
-                          <tr className="text-[10px] text-[var(--color-text-disabled)] uppercase font-bold tracking-wider">
-                            <th className="px-5 py-3 border-b border-[var(--color-border)]">#</th>
-                            <th className="px-4 py-3 border-b border(--color-border)]">Entry Time</th>
-                            <th className="px-4 py-3 border-b border-[var(--color-border)] text-center">Side</th>
-                            <th className="px-4 py-3 border-b border-[var(--color-border)] text-right">Entry</th>
-                            <th className="px-4 py-3 border-b border-[var(--color-border)] text-right">Exit</th>
-                            <th className="px-4 py-3 border-b border-[var(--color-border)] text-right">PnL%</th>
-                            <th className="px-5 py-3 border-b border-[var(--color-border)] text-right">Duration</th>
-                          </tr>
-                        </thead>
+                        <thead><tr className="text-[10px] text-[var(--color-text-disabled)] uppercase font-bold tracking-wider"><th className="px-5 py-3 border-b border-[var(--color-border)]">#</th><th className="px-4 py-3 border-b border-[var(--color-border)]">入场时间</th><th className="px-4 py-3 border-b border-[var(--color-border)] text-center">方向</th><th className="px-4 py-3 border-b border-[var(--color-border)] text-right">入场价</th><th className="px-4 py-3 border-b border-[var(--color-border)] text-right">出场价</th><th className="px-4 py-3 border-b border-[var(--color-border)] text-right">收益%</th><th className="px-5 py-3 border-b border-[var(--color-border)] text-right">持仓时长</th></tr></thead>
                         <tbody className="divide-y divide-[var(--color-border)]/50">
                           {displayResult.trades.map((t, i) => (
-                            <tr key={i} className="hover:bg-[var(--color-bg-hover)] transition-colors">
-                              <td className="px-5 py-3 text-[10px] font-bold text-[var(--color-text-disabled)]">{i + 1}</td>
-                              <td className="px-4 py-3 text-[11px] font-bold font-[var(--font-mono)]">{t.entry_time}</td>
-                              <td className="px-4 py-3 text-center">
-                                <span className={`text-[9px] px-1.5 py-0.5 rounded font-black uppercase ${t.side === 'LONG' ? 'bg-[var(--color-long)]/10 text-[var(--color-long)]' : 'bg-[var(--color-short)]/10 text-[var(--color-short)]'}`}>{t.side === 'LONG' ? 'Long' : 'Short'}</span>
-                              </td>
-                              <td className="px-4 py-3 text-[11px] font-bold font-[var(--font-mono)] text-right">{t.entry_price.toLocaleString()}</td>
-                              <td className="px-4 py-3 text-[11px] font-bold font-[var(--font-mono)] text-right">{t.exit_price.toLocaleString()}</td>
-                              <td className={`px-4 py-3 text-[11px] font-black font-[var(--font-mono)] text-right ${t.pnl_pct >= 0 ? 'text-[var(--color-long)]' : 'text-[var(--color-short)]'}`}>{t.pnl_pct >= 0 ? '+' : ''}{t.pnl_pct.toFixed(2)}%</td>
-                              <td className="px-5 py-3 text-[10px] font-bold text-[var(--color-text-secondary)] text-right">{t.duration}</td>
-                            </tr>
+                            <tr key={i} className="hover:bg-[var(--color-bg-hover)] transition-colors"><td className="px-5 py-3 text-[10px] font-bold text-[var(--color-text-disabled)]">{i + 1}</td><td className="px-4 py-3 text-[11px] font-bold font-[var(--font-mono)]">{t.entry_time}</td><td className="px-4 py-3 text-center"><span className={`text-[9px] px-1.5 py-0.5 rounded font-black uppercase ${t.side === 'LONG' ? 'bg-[var(--color-long)]/10 text-[var(--color-long)]' : 'bg-[var(--color-short)]/10 text-[var(--color-short)]'}`}>{t.side === 'LONG' ? '做多' : '做空'}</span></td><td className="px-4 py-3 text-[11px] font-bold font-[var(--font-mono)] text-right">{t.entry_price.toLocaleString()}</td><td className="px-4 py-3 text-[11px] font-bold font-[var(--font-mono)] text-right">{t.exit_price.toLocaleString()}</td><td className={`px-4 py-3 text-[11px] font-black font-[var(--font-mono)] text-right ${t.pnl_pct >= 0 ? 'text-[var(--color-long)]' : 'text-[var(--color-short)]'}`}>{t.pnl_pct >= 0 ? '+' : ''}{t.pnl_pct.toFixed(2)}%</td><td className="px-5 py-3 text-[10px] font-bold text-[var(--color-text-secondary)] text-right">{t.duration}</td></tr>
                           ))}
                         </tbody>
                       </table>
@@ -590,37 +528,16 @@ export function BacktestPage() {
               )
             ) : (
               records.length === 0 ? (
-                <div className="h-full flex flex-col items-center justify-center text-[var(--color-text-disabled)] opacity-30">
-                  <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" className="mb-3"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="9" x2="15" y2="9"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="11" y2="17"/></svg>
-                  <div className="text-sm font-bold uppercase tracking-widest">No backtest history yet</div>
-                </div>
+                <div className="h-full flex flex-col items-center justify-center text-[var(--color-text-disabled)] opacity-30"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" className="mb-3"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="9" x2="15" y2="9"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="11" y2="17"/></svg><div className="text-sm font-bold uppercase tracking-widest">暂无回测记录</div></div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   {records.map((r) => (
                     <div key={r.id} onClick={() => handleViewDetail(r.id)} className="bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-xl p-5 hover:border-[var(--color-accent)] cursor-pointer transition-all shadow-sm group">
                       <div className="flex items-center justify-between mb-4">
-                        <div className="min-w-0">
-                          {editingId === r.id ? (
-                            <input type="text" value={editName} onChange={(e) => setEditName(e.target.value)} onBlur={() => handleRename(r.id)} onKeyDown={(e) => { if (e.key === 'Enter') handleRename(r.id); if (e.key === 'Escape') setEditingId(null) }} onClick={(e) => e.stopPropagation()} autoFocus className="text-sm font-black !py-0.5 !px-1 w-full" />
-                          ) : (
-                            <div className="text-sm font-black truncate group-hover:text-[var(--color-accent)] transition-colors">{r.name}</div>
-                          )}
-                          <div className="text-[10px] text-[var(--color-text-disabled)] font-bold uppercase mt-1">{r.symbol} · {r.interval} · {r.leverage}x</div>
-                        </div>
-                        <div className="flex items-center gap-1">
-                          <button onClick={(e) => { e.stopPropagation(); deleteRecord(r.id) }} className="p-1.5 rounded-full hover:bg-[var(--color-short)]/10 text-[var(--color-text-disabled)] hover:text-[var(--color-short)] transition-all"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button>
-                        </div>
+                        <div className="min-w-0">{editingId === r.id ? (<input type="text" value={editName} onChange={(e) => setEditName(e.target.value)} onBlur={() => handleRename(r.id)} onKeyDown={(e) => { if (e.key === 'Enter') handleRename(r.id); if (e.key === 'Escape') setEditingId(null) }} onClick={(e) => e.stopPropagation()} autoFocus className="text-sm font-black !py-0.5 !px-1 w-full" />) : (<div className="text-sm font-black truncate group-hover:text-[var(--color-accent)] transition-colors">{r.name}</div>)}<div className="text-[10px] text-[var(--color-text-disabled)] font-bold uppercase mt-1">{r.symbol} · {r.interval} · {r.leverage}x</div></div>
+                        <div className="flex items-center gap-1"><button onClick={(e) => { e.stopPropagation(); void handleExportMarkdown(r.id) }} className="px-2 py-1 rounded-md bg-[var(--color-bg-input)] text-[9px] font-black uppercase text-[var(--color-text-secondary)] border border-[var(--color-border)] hover:text-[var(--color-accent)] hover:border-[var(--color-accent)] transition-all">MD</button><button onClick={(e) => { e.stopPropagation(); deleteRecord(r.id) }} className="p-1.5 rounded-full hover:bg-[var(--color-short)]/10 text-[var(--color-text-disabled)] hover:text-[var(--color-short)] transition-all"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button></div>
                       </div>
-                      <div className="flex items-end justify-between">
-                        <div>
-                          <div className="text-[10px] text-[var(--color-text-disabled)] font-bold uppercase mb-1">Total Return</div>
-                          <div className={`text-xl font-black font-[var(--font-mono)] ${r.total_return >= 0 ? 'text-[var(--color-long)]' : 'text-[var(--color-short)]'}`}>{r.total_return > 0 ? '+' : ''}{r.total_return}%</div>
-                        </div>
-                        <div className="text-right">
-                          <div className="text-[9px] text-[var(--color-text-disabled)] font-bold uppercase mb-1">Win Rate</div>
-                          <div className="text-sm font-black">{r.win_rate}%</div>
-                        </div>
-                      </div>
+                      <div className="flex items-end justify-between"><div><div className="text-[10px] text-[var(--color-text-disabled)] font-bold uppercase mb-1">总收益率</div><div className={`text-xl font-black font-[var(--font-mono)] ${r.total_return_pct >= 0 ? 'text-[var(--color-long)]' : 'text-[var(--color-short)]'}`}>{r.total_return_pct > 0 ? '+' : ''}{r.total_return_pct}%</div></div><div className="text-right"><div className="text-[9px] text-[var(--color-text-disabled)] font-bold uppercase mb-1">胜率</div><div className="text-sm font-black">{r.win_rate}%</div></div></div>
                     </div>
                   ))}
                 </div>
