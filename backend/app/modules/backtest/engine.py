@@ -444,6 +444,28 @@ def _lt(a: list[float | None], val: float, i: int) -> bool:
     return a[i] is not None and a[i] < val
 
 
+def _flatten_groups(groups: list[list[dict]] | None) -> list[dict]:
+    """Flatten OR-of-AND groups into a single list for indicator pre-computation."""
+    if not groups:
+        return []
+    return [c for group in groups for c in group]
+
+
+def _evaluate_condition_groups(groups: list[list[dict]], indicators: dict, i: int) -> bool:
+    """
+    OR-of-AND evaluation:
+    Returns True if ANY group has ALL its conditions satisfied.
+    Empty groups list → False (no signal).
+    """
+    if not groups:
+        return False
+    return any(
+        all(evaluate_condition(c, indicators, i) for c in group)
+        for group in groups
+        if group  # skip empty inner lists
+    )
+
+
 def evaluate_condition(cond: dict, indicators: dict, i: int) -> bool:
     """
     评估单个条件。条件格式：
@@ -524,16 +546,16 @@ def evaluate_condition(cond: dict, indicators: dict, i: int) -> bool:
 
 def run_backtest(
     klines: list[dict],
-    entry_conditions: list[dict],
-    exit_conditions: list[dict],
+    entry_conditions: list[list[dict]],
+    exit_conditions: list[list[dict]],
     stop_loss_pct: float,
     take_profit_pct: float,
     initial_balance: float = 10000.0,
     risk_per_trade: float = 2.0,
     leverage: int = 1,
     strategy_mode: str = "long_only",  # long_only, short_only, bidirectional
-    long_entry_conditions: list[dict] | None = None,  # 做多入场条件
-    short_entry_conditions: list[dict] | None = None,  # 做空入场条件
+    long_entry_conditions: list[list[dict]] | None = None,  # 做多入场条件
+    short_entry_conditions: list[list[dict]] | None = None,  # 做空入场条件
     # 兼容旧接口
     fast_period: int | None = None,
     slow_period: int | None = None,
@@ -560,8 +582,8 @@ def run_backtest(
 
     # 兼容旧接口：如果没有传 conditions，用 fast/slow MA 交叉
     if not entry_conditions and fast_period and slow_period:
-        entry_conditions = [{"type": "MA", "fast": fast_period, "slow": slow_period, "op": "cross_above"}]
-        exit_conditions = [{"type": "MA", "fast": fast_period, "slow": slow_period, "op": "cross_below"}]
+        entry_conditions = [[{"type": "MA", "fast": fast_period, "slow": slow_period, "op": "cross_above"}]]
+        exit_conditions = [[{"type": "MA", "fast": fast_period, "slow": slow_period, "op": "cross_below"}]]
 
     # 双向交易：如果没有单独指定做多/做空条件，使用通用条件
     if strategy_mode == "bidirectional":
@@ -570,14 +592,14 @@ def run_backtest(
         if short_entry_conditions is None:
             short_entry_conditions = exit_conditions if exit_conditions else entry_conditions
 
-    # 预计算所有需要的指标
-    all_conditions = entry_conditions + exit_conditions
-    if long_entry_conditions:
-        all_conditions += long_entry_conditions
-    if short_entry_conditions:
-        all_conditions += short_entry_conditions
-
-    indicator_data = _precompute_indicators(closes, highs, lows, all_conditions)
+    # 预计算所有需要的指标（将 OR-of-AND 嵌套结构展平后去重计算）
+    all_flat = (
+        _flatten_groups(entry_conditions)
+        + _flatten_groups(exit_conditions)
+        + _flatten_groups(long_entry_conditions)
+        + _flatten_groups(short_entry_conditions)
+    )
+    indicator_data = _precompute_indicators(closes, highs, lows, all_flat)
     # 添加收盘价到指标数据（用于布林带判断）
     indicator_data["closes"] = closes
 
@@ -633,7 +655,7 @@ def _run_unidirectional_backtest(
 
     for i in range(1, len(klines)):
         if not in_position:
-            all_met = entry_conditions and all(evaluate_condition(c, indicator_data, i) for c in entry_conditions)
+            all_met = _evaluate_condition_groups(entry_conditions, indicator_data, i)
             if all_met:
                 entry_price = klines[i]["close"]
                 entry_time = datetime.fromtimestamp(klines[i]["time"] / 1000).strftime("%Y-%m-%d %H:%M")
@@ -665,7 +687,7 @@ def _run_unidirectional_backtest(
                 should_exit = True
             elif pnl_pct >= take_profit_pct * leverage:
                 should_exit = True
-            elif exit_conditions and any(evaluate_condition(c, indicator_data, i) for c in exit_conditions):
+            elif _evaluate_condition_groups(exit_conditions, indicator_data, i):
                 should_exit = True
 
             if should_exit:
@@ -738,12 +760,8 @@ def _run_bidirectional_backtest(
                 short_signal = False
         else:
             # 手动指定条件模式
-            long_signal = long_position is None and long_entry_conditions and all(
-                evaluate_condition(c, indicator_data, i) for c in long_entry_conditions
-            )
-            short_signal = short_position is None and short_entry_conditions and all(
-                evaluate_condition(c, indicator_data, i) for c in short_entry_conditions
-            )
+            long_signal = long_position is None and _evaluate_condition_groups(long_entry_conditions, indicator_data, i)
+            short_signal = short_position is None and _evaluate_condition_groups(short_entry_conditions, indicator_data, i)
 
         # 检查是否触发做多
         if long_position is None and long_signal:
@@ -978,9 +996,10 @@ def _precompute_indicators(closes, highs, lows, conditions):
     return data
 
 
-def _empty_result():
+def _empty_result(initial_balance: float = 10000.0):
     return {
-        "total_return": 0, "win_rate": 0, "profit_factor": 0,
+        "total_return_pct": 0.0, "final_balance": initial_balance,
+        "win_rate": 0, "profit_factor": 0,
         "max_drawdown": 0, "sharpe_ratio": 0, "total_trades": 0,
         "avg_holding_hours": 0, "trades": [],
     }
@@ -988,7 +1007,7 @@ def _empty_result():
 
 def _calc_stats(trades, balance, initial_balance, max_drawdown):
     if not trades:
-        return _empty_result()
+        return _empty_result(initial_balance)
 
     wins = [t for t in trades if t["pnl"] > 0]
     losses = [t for t in trades if t["pnl"] <= 0]
@@ -1000,7 +1019,8 @@ def _calc_stats(trades, balance, initial_balance, max_drawdown):
     std_return = math.sqrt(sum((r - avg_return) ** 2 for r in returns) / len(returns)) if len(returns) > 1 else 1
 
     return {
-        "total_return": round(((balance - initial_balance) / initial_balance) * 100, 2),
+        "total_return_pct": round(((balance - initial_balance) / initial_balance) * 100, 2),
+        "final_balance": round(balance, 2),
         "win_rate": round(len(wins) / len(trades) * 100, 1),
         "profit_factor": round(total_profit / total_loss, 2) if total_loss > 0 else 0,
         "max_drawdown": round(max_drawdown, 2),

@@ -18,6 +18,7 @@ class BacktestRecord(Base):
     start_date: Mapped[str] = mapped_column(String(20))
     end_date: Mapped[str] = mapped_column(String(20))
     leverage: Mapped[int] = mapped_column(Integer, default=1)
+    initial_balance: Mapped[float] = mapped_column(Float, default=10000.0, server_default="10000")
     stop_loss_pct: Mapped[float] = mapped_column(Float, default=2.0)
     take_profit_pct: Mapped[float] = mapped_column(Float, default=6.0)
     risk_per_trade: Mapped[float] = mapped_column(Float, default=2.0)
@@ -25,6 +26,7 @@ class BacktestRecord(Base):
     exit_conditions: Mapped[str] = mapped_column(Text, default="[]")
     # 回测结果
     total_return: Mapped[float] = mapped_column(Float, default=0.0)
+    final_balance: Mapped[float] = mapped_column(Float, default=10000.0, server_default="10000")
     win_rate: Mapped[float] = mapped_column(Float, default=0.0)
     profit_factor: Mapped[float] = mapped_column(Float, default=0.0)
     max_drawdown: Mapped[float] = mapped_column(Float, default=0.0)

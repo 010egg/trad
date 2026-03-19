@@ -18,6 +18,16 @@ async def lifespan(app: FastAPI):
         from app.modules.backtest import models as _backtest_models  # noqa: F401
         from app.modules.risk.models import DailyLossRecord  # noqa: F401
         await conn.run_sync(Base.metadata.create_all)
+        # 补充新增列（SQLite 不支持 create_all 自动 ALTER，逐列检查添加）
+        from sqlalchemy import text
+        for col, definition in [
+            ("initial_balance", "FLOAT NOT NULL DEFAULT 10000"),
+            ("final_balance", "FLOAT NOT NULL DEFAULT 10000"),
+        ]:
+            try:
+                await conn.execute(text(f"ALTER TABLE backtest_records ADD COLUMN {col} {definition}"))
+            except Exception:
+                pass  # 列已存在，忽略
     yield
     await ws_manager.shutdown()
 

@@ -25,7 +25,9 @@ def _wrap(data):
 def _auto_name(req: BacktestRequest) -> str:
     """自动生成策略名称"""
     parts = []
-    for c in req.entry_conditions:
+    # entry_conditions is now list[list[ConditionItem]]; flatten for naming
+    flat = [c for group in req.entry_conditions for c in group]
+    for c in flat:
         t = c.type.upper()
         if t in ("MA", "EMA"):
             parts.append(f"{t}{c.fast or 20}x{c.slow or 60}")
@@ -48,18 +50,18 @@ async def run(req: BacktestRequest, db: DB, user: User = Depends(get_current_use
     if not klines:
         return _wrap({"error": "无法获取历史数据", "trades": []})
 
-    # 转为引擎需要的 dict 格式
-    entry_conds = [c.model_dump(exclude_none=True) for c in req.entry_conditions]
-    exit_conds = [c.model_dump(exclude_none=True) for c in req.exit_conditions]
+    # 转为引擎需要的 list[list[dict]] 格式（OR-of-AND groups）
+    entry_conds = [[c.model_dump(exclude_none=True) for c in group] for group in req.entry_conditions]
+    exit_conds = [[c.model_dump(exclude_none=True) for c in group] for group in req.exit_conditions]
 
     # 双向交易：分别处理做多和做空的入场条件
     long_entry_conds = None
     short_entry_conds = None
     if req.strategy_mode == "bidirectional":
         if req.long_entry_conditions:
-            long_entry_conds = [c.model_dump(exclude_none=True) for c in req.long_entry_conditions]
+            long_entry_conds = [[c.model_dump(exclude_none=True) for c in group] for group in req.long_entry_conditions]
         if req.short_entry_conditions:
-            short_entry_conds = [c.model_dump(exclude_none=True) for c in req.short_entry_conditions]
+            short_entry_conds = [[c.model_dump(exclude_none=True) for c in group] for group in req.short_entry_conditions]
 
     # 兼容旧接口
     fast_period = None
@@ -76,6 +78,7 @@ async def run(req: BacktestRequest, db: DB, user: User = Depends(get_current_use
         short_entry_conditions=short_entry_conds,
         stop_loss_pct=req.stop_loss_pct,
         take_profit_pct=req.take_profit_pct,
+        initial_balance=req.initial_balance,
         risk_per_trade=req.risk_per_trade,
         leverage=req.leverage,
         strategy_mode=req.strategy_mode,
@@ -92,12 +95,14 @@ async def run(req: BacktestRequest, db: DB, user: User = Depends(get_current_use
         start_date=req.start_date,
         end_date=req.end_date,
         leverage=req.leverage,
+        initial_balance=req.initial_balance,
         stop_loss_pct=req.stop_loss_pct,
         take_profit_pct=req.take_profit_pct,
         risk_per_trade=req.risk_per_trade,
         entry_conditions=json.dumps(entry_conds),
         exit_conditions=json.dumps(exit_conds),
-        total_return=result["total_return"],
+        total_return=result["total_return_pct"],
+        final_balance=result["final_balance"],
         win_rate=result["win_rate"],
         profit_factor=result["profit_factor"],
         max_drawdown=result["max_drawdown"],
@@ -110,7 +115,7 @@ async def run(req: BacktestRequest, db: DB, user: User = Depends(get_current_use
     await db.commit()
     await db.refresh(record)
 
-    return _wrap({**result, "record_id": record.id})
+    return _wrap({**result, "record_id": str(record.id)})
 
 
 @router.get("/records")
@@ -121,9 +126,11 @@ async def list_records(db: DB, user: User = Depends(get_current_user)):
         BacktestRecordResponse(
             id=r.id, name=r.name, symbol=r.symbol, interval=r.interval,
             start_date=r.start_date, end_date=r.end_date, leverage=r.leverage,
+            initial_balance=r.initial_balance,
             stop_loss_pct=r.stop_loss_pct, take_profit_pct=r.take_profit_pct,
             risk_per_trade=r.risk_per_trade,
-            total_return=r.total_return, win_rate=r.win_rate, profit_factor=r.profit_factor,
+            total_return_pct=r.total_return, final_balance=r.final_balance,
+            win_rate=r.win_rate, profit_factor=r.profit_factor,
             max_drawdown=r.max_drawdown, sharpe_ratio=r.sharpe_ratio,
             total_trades=r.total_trades, avg_holding_hours=r.avg_holding_hours,
             created_at=r.created_at.isoformat(),
@@ -142,9 +149,11 @@ async def get_record(record_id: str, db: DB, user: User = Depends(get_current_us
     data = BacktestRecordDetail(
         id=record.id, name=record.name, symbol=record.symbol, interval=record.interval,
         start_date=record.start_date, end_date=record.end_date, leverage=record.leverage,
+        initial_balance=record.initial_balance,
         stop_loss_pct=record.stop_loss_pct, take_profit_pct=record.take_profit_pct,
         risk_per_trade=record.risk_per_trade,
-        total_return=record.total_return, win_rate=record.win_rate, profit_factor=record.profit_factor,
+        total_return_pct=record.total_return, final_balance=record.final_balance,
+        win_rate=record.win_rate, profit_factor=record.profit_factor,
         max_drawdown=record.max_drawdown, sharpe_ratio=record.sharpe_ratio,
         total_trades=record.total_trades, avg_holding_hours=record.avg_holding_hours,
         entry_conditions=record.entry_conditions, exit_conditions=record.exit_conditions,
