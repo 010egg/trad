@@ -17,6 +17,92 @@
   --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
 }
 
+@keyframes flash-up {
+  0% { background-color: rgba(63, 182, 139, 0.25); }
+  100% { background-color: transparent; }
+}
+
+@keyframes flash-down {
+  0% { background-color: rgba(255, 104, 56, 0.25); }
+  100% { background-color: transparent; }
+}
+
+.animate-flash-up {
+  animation: flash-up 0.8s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+.animate-flash-down {
+  animation: flash-down 0.8s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+/* 优化滚动条样式 */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 10px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-disabled);
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Resize Handle Styles */
+.resize-handle {
+  background: var(--color-border);
+  transition: background 0.2s ease;
+  position: relative;
+  z-index: 50;
+}
+
+.resize-handle:hover,
+.resize-handle[data-resize-handle-active] {
+  background: var(--color-accent);
+}
+
+.resize-handle-horizontal {
+  width: 2px;
+  cursor: col-resize;
+  margin: 0 -1px;
+}
+
+.resize-handle-vertical {
+  height: 2px;
+  cursor: row-resize;
+  margin: -1px 0;
+}
+
+.resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: var(--color-text-disabled);
+  border-radius: 4px;
+}
+
+.resize-handle-horizontal::after {
+  width: 1.5px;
+  height: 20px;
+}
+
+.resize-handle-vertical::after {
+  width: 20px;
+  height: 1.5px;
+}
+
 body {
   background-color: var(--color-bg-primary);
   color: var(--color-text-primary);

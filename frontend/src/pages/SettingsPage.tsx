@@ -169,8 +169,27 @@ export function SettingsPage() {
 
           {activeTab === 'trade' && (
             <>
-              <h1 className="text-2xl font-semibold mb-1">交易设置</h1>
-              <p className="text-sm text-[var(--color-text-secondary)] mb-8">配置交易模式和默认市场设置。</p>
+              <div className="flex flex-col gap-4 mb-8 pb-6 border-b border-[var(--color-border)] lg:flex-row lg:items-start lg:justify-between">
+                <div>
+                  <h1 className="text-2xl font-semibold mb-1">交易设置</h1>
+                  <p className="text-sm text-[var(--color-text-secondary)]">配置交易模式和默认市场设置。</p>
+                </div>
+                <div className="lg:min-w-[280px]">
+                  <div className="text-[10px] font-bold uppercase tracking-[0.24em] text-[var(--color-text-disabled)] mb-2">
+                    默认市场
+                  </div>
+                  <div className={`inline-flex rounded-full px-3 py-1.5 text-xs font-black tracking-[0.18em] ${
+                    defaultMarket === 'FUTURES'
+                      ? 'bg-[var(--color-short)]/10 text-[var(--color-short)] border border-[var(--color-short)]/20'
+                      : 'bg-[var(--color-accent)]/10 text-[var(--color-accent)] border border-[var(--color-accent)]/20'
+                  }`}>
+                    {defaultMarket === 'FUTURES' ? '合约 FUTURES' : '现货 SPOT'}
+                  </div>
+                  <div className="mt-2 text-xs text-[var(--color-text-disabled)]">
+                    顶部导航栏可直接切换，点击后立即生效。
+                  </div>
+                </div>
+              </div>
 
               {/* 交易模式 */}
               <div className="mb-8">
@@ -224,17 +243,16 @@ export function SettingsPage() {
                 <h2 className="text-lg font-semibold mb-4 pb-2 border-b border-[var(--color-border)]">市场设置</h2>
                 <div className="flex items-start justify-between py-4 border-b border-[var(--color-border)]">
                   <div className="flex-1 mr-6">
-                    <div className="font-medium mb-0.5">交易市场</div>
-                    <div className="text-xs text-[var(--color-text-disabled)]">选择默认交易的市场类型</div>
+                    <div className="font-medium mb-0.5">当前默认市场</div>
+                    <div className="text-xs text-[var(--color-text-disabled)]">已移动到顶部标题栏快速切换</div>
                   </div>
-                  <select
-                    value={defaultMarket}
-                    onChange={(e) => setDefaultMarket(e.target.value)}
-                    className="!w-32"
-                  >
-                    <option value="SPOT">现货 (Spot)</option>
-                    <option value="FUTURES">合约 (Futures)</option>
-                  </select>
+                  <div className={`rounded-full px-3 py-1 text-xs font-black tracking-wider ${
+                    defaultMarket === 'FUTURES'
+                      ? 'bg-[var(--color-short)]/10 text-[var(--color-short)] border border-[var(--color-short)]/20'
+                      : 'bg-[var(--color-accent)]/10 text-[var(--color-accent)] border border-[var(--color-accent)]/20'
+                  }`}>
+                    {defaultMarket === 'FUTURES' ? '合约 FUTURES' : '现货 SPOT'}
+                  </div>
                 </div>
                 {defaultMarket === 'FUTURES' && (
                   <div className="flex items-start justify-between py-4">

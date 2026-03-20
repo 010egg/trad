@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { createChart, IChartApi, ISeriesApi, Time } from 'lightweight-charts'
-import { useMarketStore } from '@/stores/useMarketStore'
+import { MARKET_KLINE_LIMIT, useMarketStore } from '@/stores/useMarketStore'
 import { useBacktestSignalStore } from '@/stores/useBacktestSignalStore'
 import api from '@/lib/api'
 
@@ -95,17 +95,18 @@ export function KlineChart({ indicators = [] }: KlineChartProps) {
     })
     chart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } })
 
-    const resize = () => {
-      if (chartRef.current) {
-        chart.applyOptions({
-          width: chartRef.current.clientWidth,
-          height: chartRef.current.clientHeight || 600,
-        })
-      }
+    const observer = new ResizeObserver((entries) => {
+      if (!entries.length) return
+      const { width, height } = entries[0].contentRect
+      chart.applyOptions({ width, height })
+    })
+
+    if (chartRef.current) {
+      observer.observe(chartRef.current)
     }
-    window.addEventListener('resize', resize)
+
     return () => {
-      window.removeEventListener('resize', resize)
+      observer.disconnect()
       chart.remove()
       chartApi.current = null
       candleRef.current = null
@@ -211,7 +212,7 @@ export function KlineChart({ indicators = [] }: KlineChartProps) {
       try {
         const requestId = ++indicatorRequestRef.current
         const data: Record<string, { time: number; value: number }[]> = await api.post('/market/indicators', {
-          symbol, interval, limit: 1000,
+          symbol, interval, limit: MARKET_KLINE_LIMIT,
           indicators: indicators.map(ind => ({ ...ind, type: ind.type }))
         })
 

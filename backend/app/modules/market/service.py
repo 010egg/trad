@@ -1,7 +1,12 @@
 import asyncio
+import json
 import os
 
 import httpx
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.modules.backtest.models import HistoricalKline
 
 BINANCE_BASE_URL = "https://api.binance.com"
 
@@ -22,14 +27,34 @@ SUPPORTED_SYMBOLS = [
 async def fetch_klines(symbol: str, interval: str, limit: int) -> list[dict]:
     """从 Binance 获取 K 线数据"""
     url = f"{BINANCE_BASE_URL}/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
 
     try:
         # 使用系统代理设置（从环境变量）
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, proxy=PROXY) as client:
-            resp = await client.get(url, params=params)
-            resp.raise_for_status()
-            raw = resp.json()
+            all_rows: list[list] = []
+            end_time: int | None = None
+
+            while len(all_rows) < limit:
+                remaining = limit - len(all_rows)
+                params = {"symbol": symbol, "interval": interval, "limit": min(remaining, 1000)}
+                if end_time is not None:
+                    params["endTime"] = end_time
+
+                resp = await client.get(url, params=params)
+                resp.raise_for_status()
+                raw = resp.json()
+                if not raw:
+                    break
+
+                all_rows = raw + all_rows
+                if len(raw) < params["limit"]:
+                    break
+
+                earliest_open_time = int(raw[0][0])
+                next_end_time = earliest_open_time - 1
+                if end_time is not None and next_end_time >= end_time:
+                    break
+                end_time = next_end_time
 
         return [
             {
@@ -40,11 +65,67 @@ async def fetch_klines(symbol: str, interval: str, limit: int) -> list[dict]:
                 "close": float(k[4]),
                 "volume": float(k[5]),
             }
-            for k in raw
+            for k in all_rows[-limit:]
         ]
     except Exception as e:
         print(f"[Market] Error fetching klines: {e}")
         raise
+
+
+def _historical_row_to_dict(row: HistoricalKline) -> dict:
+    return {
+        "time": int(row.open_time) // 1000,
+        "open": float(row.open),
+        "high": float(row.high),
+        "low": float(row.low),
+        "close": float(row.close),
+        "volume": float(row.volume),
+    }
+
+
+async def _fetch_cached_klines_before(
+    db: AsyncSession,
+    symbol: str,
+    interval: str,
+    before_time_seconds: int,
+    limit: int,
+) -> list[dict]:
+    if limit <= 0:
+        return []
+
+    stmt = (
+        select(HistoricalKline)
+        .where(
+            HistoricalKline.symbol == symbol,
+            HistoricalKline.interval == interval,
+            HistoricalKline.open_time < before_time_seconds * 1000,
+        )
+        .order_by(HistoricalKline.open_time.desc())
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    return [_historical_row_to_dict(row) for row in reversed(rows)]
+
+
+async def fetch_chart_klines(db: AsyncSession, symbol: str, interval: str, limit: int) -> list[dict]:
+    latest_klines = await fetch_klines(symbol, interval, min(limit, 1000))
+    if not latest_klines or limit <= 1000:
+        return latest_klines
+
+    earliest_remote_time = int(latest_klines[0]["time"])
+    cached_older = await _fetch_cached_klines_before(
+        db=db,
+        symbol=symbol,
+        interval=interval,
+        before_time_seconds=earliest_remote_time,
+        limit=limit - len(latest_klines),
+    )
+
+    deduped: dict[int, dict] = {
+        int(item["time"]): item
+        for item in [*cached_older, *latest_klines]
+    }
+    return [deduped[key] for key in sorted(deduped.keys())][-limit:]
 
 
 async def fetch_current_prices(symbols: list[str]) -> dict[str, float]:
@@ -87,3 +168,49 @@ async def fetch_current_prices(symbols: list[str]) -> dict[str, float]:
             result[symbol] = price
 
         return result
+
+
+async def fetch_ticker_snapshots(symbols: list[str]) -> list[dict]:
+    """批量获取最新价格和 24h 涨跌幅。"""
+    if not symbols:
+        return []
+
+    unique_symbols = list(dict.fromkeys(symbol.upper() for symbol in symbols))
+    url = f"{BINANCE_BASE_URL}/api/v3/ticker/24hr"
+
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, proxy=PROXY) as client:
+        try:
+            resp = await client.get(url, params={"symbols": json.dumps(unique_symbols, separators=(",", ":"))})
+            resp.raise_for_status()
+            raw = resp.json()
+            if isinstance(raw, dict):
+                raw = [raw]
+
+            lookup = {
+                item["symbol"]: {
+                    "symbol": item["symbol"],
+                    "price": float(item["lastPrice"]),
+                    "price_change_pct": float(item["priceChangePercent"]),
+                }
+                for item in raw
+                if item.get("symbol")
+            }
+            return [lookup[symbol] for symbol in unique_symbols if symbol in lookup]
+        except Exception as e:
+            print(f"[Market] Batch ticker fetch failed, fallback to per-symbol fetch: {e}")
+
+        async def fetch_single(symbol: str) -> dict | None:
+            try:
+                resp = await client.get(url, params={"symbol": symbol})
+                resp.raise_for_status()
+                raw = resp.json()
+                return {
+                    "symbol": raw["symbol"],
+                    "price": float(raw["lastPrice"]),
+                    "price_change_pct": float(raw["priceChangePercent"]),
+                }
+            except Exception:
+                return None
+
+        entries = await asyncio.gather(*(fetch_single(symbol) for symbol in unique_symbols))
+        return [entry for entry in entries if entry is not None]

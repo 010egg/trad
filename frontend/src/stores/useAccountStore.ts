@@ -2,6 +2,12 @@ import { create } from 'zustand'
 import api from '@/lib/api'
 
 let positionsRequest: Promise<void> | null = null
+let positionsRequestSeq = 0
+
+interface FetchPositionsOptions {
+  background?: boolean
+  force?: boolean
+}
 
 interface Position {
   symbol: string
@@ -37,7 +43,7 @@ interface AccountState {
   positionsLoading: boolean
   positionsLoaded: boolean
   positionsError: string | null
-  fetchPositions: () => Promise<void>
+  fetchPositions: (options?: FetchPositionsOptions) => Promise<void>
   fetchOrders: () => Promise<void>
   createOrder: (params: any) => Promise<any>
   closePosition: (orderId: string) => Promise<void>
@@ -52,37 +58,55 @@ export const useAccountStore = create<AccountState>((set) => ({
   positionsLoaded: false,
   positionsError: null,
 
-  fetchPositions: async () => {
-    if (positionsRequest) {
+  fetchPositions: async (options = {}) => {
+    const { background = false, force = false } = options
+    if (positionsRequest && !force) {
       return positionsRequest
     }
 
-    positionsRequest = (async () => {
+    const requestSeq = ++positionsRequestSeq
+    let request: Promise<void> | null = null
+    request = (async () => {
       try {
-        set({ loading: true, error: null, positionsLoading: true, positionsError: null })
+        if (background) {
+          set({ positionsError: null })
+        } else {
+          set({ loading: true, error: null, positionsLoading: true, positionsError: null })
+        }
+
         const positions: Position[] = await api.get('/trade/positions')
-        set({
+        if (requestSeq !== positionsRequestSeq) {
+          return
+        }
+        set((state) => ({
           positions,
-          loading: false,
+          loading: background ? state.loading : false,
+          error: background ? state.error : null,
           positionsLoading: false,
           positionsLoaded: true,
           positionsError: null,
-        })
+        }))
       } catch (err: any) {
         const message = err.response?.data?.detail || 'Failed to fetch positions'
-        set({
-          error: message,
-          loading: false,
+        if (requestSeq !== positionsRequestSeq) {
+          return
+        }
+        set((state) => ({
+          error: background ? state.error : message,
+          loading: background ? state.loading : false,
           positionsLoading: false,
           positionsLoaded: true,
           positionsError: message,
-        })
+        }))
       } finally {
-        positionsRequest = null
+        if (positionsRequest === request) {
+          positionsRequest = null
+        }
       }
     })()
 
-    return positionsRequest
+    positionsRequest = request
+    return request
   },
 
   fetchOrders: async () => {

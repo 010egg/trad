@@ -17,6 +17,14 @@ interface Result {
   final_balance?: number;
 }
 
+interface AvailableDataItem {
+  symbol: string
+  interval: string
+  count: number
+  start_date: string
+  end_date: string
+}
+
 interface StoredCondition {
   type?: string
   op?: string
@@ -308,6 +316,7 @@ export function BacktestPage() {
   const [detailRecord, setDetailRecord] = useState<BacktestRecordDetail | null>(null)
   const [historySortField, setHistorySortField] = useState<HistorySortField>('total_return_pct')
   const [historySortDirection, setHistorySortDirection] = useState<'desc' | 'asc'>('desc')
+  const [availableData, setAvailableData] = useState<AvailableDataItem[]>([])
 
   const handleNumberInputChange = (setter: (v: string) => void) => (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = e.target.value
@@ -315,6 +324,19 @@ export function BacktestPage() {
   }
 
   useEffect(() => { void fetchRecords() }, [fetchRecords])
+
+  useEffect(() => {
+    const fetchAvailableData = async () => {
+      try {
+        const rows: AvailableDataItem[] = await api.get('/backtest/available-data')
+        setAvailableData(rows)
+      } catch (error) {
+        console.error('Failed to fetch available historical data:', error)
+      }
+    }
+
+    void fetchAvailableData()
+  }, [])
 
   const condToApi = (cond: Condition) => {
     const obj: Record<string, unknown> = { type: cond.type, op: cond.op }
@@ -372,6 +394,7 @@ export function BacktestPage() {
   }
 
   const displayResult = detailResult || result
+  const selectedDataCoverage = availableData.find((item) => item.symbol === symbol && item.interval === interval)
   const sortedRecords = [...records].sort((a, b) => {
     const aValue = getRecordSortValue(a, historySortField)
     const bValue = getRecordSortValue(b, historySortField)
@@ -402,6 +425,33 @@ export function BacktestPage() {
               </div>
               <div><label className="block text-[10px] font-bold text-[var(--color-text-disabled)] uppercase mb-1.5">时间范围</label>
                 <div className="flex gap-2 items-center"><input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} className="flex-1 font-[var(--font-mono)] text-xs font-bold" /><span className="text-[var(--color-text-disabled)]">-</span><input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} className="flex-1 font-[var(--font-mono)] text-xs font-bold" /></div></div>
+              <div className={`rounded-lg border px-3 py-2 text-xs ${selectedDataCoverage ? 'border-[var(--color-accent)]/20 bg-[var(--color-accent)]/5' : 'border-[var(--color-short)]/20 bg-[var(--color-short)]/5'}`}>
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-[10px] font-black uppercase tracking-widest text-[var(--color-text-disabled)]">数据库历史数据</div>
+                    {selectedDataCoverage ? (
+                      <div className="mt-1 leading-relaxed">
+                        已缓存 {selectedDataCoverage.start_date} 到 {selectedDataCoverage.end_date}
+                        <span className="ml-2 font-[var(--font-mono)] text-[var(--color-text-secondary)]">{selectedDataCoverage.count} 条</span>
+                      </div>
+                    ) : (
+                      <div className="mt-1 text-[var(--color-short)]">当前 {symbol} / {interval} 还没有缓存数据</div>
+                    )}
+                  </div>
+                  {selectedDataCoverage && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setStartDate(selectedDataCoverage.start_date)
+                        setEndDate(selectedDataCoverage.end_date)
+                      }}
+                      className="shrink-0 rounded-md border border-[var(--color-accent)]/30 bg-[var(--color-bg-card)] px-2.5 py-1 text-[10px] font-black uppercase text-[var(--color-accent)] transition-all hover:bg-[var(--color-accent)] hover:text-white"
+                    >
+                      套用范围
+                    </button>
+                  )}
+                </div>
+              </div>
               <div><label className="block text-[10px] font-bold text-[var(--color-text-disabled)] uppercase mb-1.5">杠杆倍数</label>
                 <div className="flex items-center gap-3"><input type="range" min={1} max={125} value={leverage} onChange={(e) => setLeverage(+e.target.value)} className="flex-1 h-1 accent-[var(--color-accent)]" /><span className="text-sm font-black font-[var(--font-mono)] text-[var(--color-accent)] min-w-[32px]">{leverage}x</span></div>
                 <div className="flex gap-1 mt-2 flex-wrap">{LEVERAGE_PRESETS.map((v) => <button key={v} onClick={() => setLeverage(v)} className={`text-[10px] px-1.5 py-0.5 rounded border transition-all font-bold ${leverage === v ? 'bg-[var(--color-accent)] text-white border-[var(--color-accent)]' : 'bg-transparent text-[var(--color-text-disabled)] border-[var(--color-border)] hover:text-[var(--color-text-primary)]'}`}>{v}x</button>)}</div></div>

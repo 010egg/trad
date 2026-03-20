@@ -87,6 +87,82 @@ async def test_list_positions(client):
 
 
 @pytest.mark.asyncio
+async def test_list_live_spot_positions_returns_entry_price(client, monkeypatch):
+    token = await _get_token(client)
+
+    class FakeBinanceClient:
+        async def get_spot_account_info(self):
+            return {
+                "balances": [
+                    {"asset": "BTC", "free": "0.6", "locked": "0"},
+                    {"asset": "USDT", "free": "1000", "locked": "0"},
+                ]
+            }
+
+        async def get_my_trades(
+            self,
+            symbol: str,
+            start_time: int | None = None,
+            end_time: int | None = None,
+            limit: int | None = None,
+            from_id: int | None = None,
+        ):
+            assert symbol == "BTCUSDT"
+            assert limit == 1000
+            return [
+                {"time": 1, "isBuyer": True, "qty": "1", "quoteQty": "100"},
+                {"time": 2, "isBuyer": False, "qty": "0.4", "quoteQty": "48"},
+            ]
+
+        async def close(self):
+            return None
+
+    async def fake_get_binance_client(self, testnet: bool = False):
+        return FakeBinanceClient()
+
+    async def fake_fetch_current_prices(symbols):
+        assert symbols == ["BTCUSDT"]
+        return {"BTCUSDT": 110.0}
+
+    monkeypatch.setattr(
+        "app.modules.trade.service.TradeService.get_binance_client",
+        fake_get_binance_client,
+    )
+    monkeypatch.setattr(
+        "app.modules.trade.router.fetch_current_prices",
+        fake_fetch_current_prices,
+    )
+
+    settings_resp = await client.put(
+        "/api/v1/trade/settings",
+        json={"trade_mode": "LIVE", "default_market": "SPOT"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert settings_resp.status_code == 200
+
+    key_resp = await client.post(
+        "/api/v1/account/api-keys",
+        json={"api_key": "test-key", "api_secret": "test-secret"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert key_resp.status_code == 200
+
+    response = await client.get(
+        "/api/v1/trade/positions",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+
+    positions = response.json()["data"]
+    assert len(positions) == 1
+    assert positions[0]["symbol"] == "BTCUSDT"
+    assert positions[0]["trade_mode"] == "LIVE"
+    assert positions[0]["entry_price"] == pytest.approx(100.0)
+    assert positions[0]["current_price"] == pytest.approx(110.0)
+    assert positions[0]["price_change_pct"] == pytest.approx(10.0)
+
+
+@pytest.mark.asyncio
 async def test_close_position(client):
     token = await _get_token(client)
     # 开仓（使用小数量和合理止损价）

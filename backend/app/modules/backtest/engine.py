@@ -4,6 +4,7 @@
 """
 
 import math
+import os
 from datetime import datetime
 
 import httpx
@@ -15,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.backtest.models import HistoricalKline
 
 BINANCE_BASE_URL = "https://api.binance.com"
+PROXY = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
 BINANCE_INTERVAL_MS = {
     "1m": 60_000,
     "3m": 3 * 60_000,
@@ -129,7 +131,7 @@ async def _fetch_remote_klines_range(symbol: str, interval: str, start_ts: int, 
     all_klines: list[dict] = []
     current_start = start_ts
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(proxy=PROXY, follow_redirects=True) as client:
         while current_start < end_ts:
             params = {
                 "symbol": symbol,

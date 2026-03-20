@@ -148,7 +148,23 @@ class BinanceClient:
         balance = await client.get_asset_balance(asset=asset.upper())
         return balance or {"asset": asset.upper(), "free": "0", "locked": "0"}
 
-    async def get_my_trades(self, symbol: str, start_time: int, end_time: int) -> list:
+    async def get_my_trades(
+        self,
+        symbol: str,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        limit: int | None = None,
+        from_id: int | None = None,
+    ) -> list:
         """查询成交历史"""
         client = await self.get_client()
-        return await client.get_my_trades(symbol=symbol.upper(), startTime=start_time, endTime=end_time)
+        params = {"symbol": symbol.upper()}
+        if start_time is not None:
+            params["startTime"] = start_time
+        if end_time is not None:
+            params["endTime"] = end_time
+        if limit is not None:
+            params["limit"] = limit
+        if from_id is not None:
+            params["fromId"] = from_id
+        return await client.get_my_trades(**params)

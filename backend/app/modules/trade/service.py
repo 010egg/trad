@@ -1,5 +1,6 @@
 """交易服务层"""
 
+import asyncio
 import logging
 from decimal import Decimal
 from typing import Optional
@@ -16,6 +17,7 @@ from app.modules.account.service import decrypt_value
 from app.modules.trade.models import ApiKey
 
 logger = logging.getLogger(__name__)
+RECENT_SPOT_TRADES_LIMIT = 1000
 
 
 class TradeService:
@@ -329,23 +331,58 @@ class TradeService:
             else:
                 # 现货持仓
                 account_info = await client.get_spot_account_info()
-                result = []
+                spot_positions = []
                 for balance in account_info.get("balances", []):
                     total = float(balance.get("free", 0)) + float(balance.get("locked", 0))
                     if total > 0.0001:
                         asset = balance.get("asset", "")
                         if asset not in ("USDT", "BUSD", "USD"):
                             symbol = f"{asset}USDT"
-                            result.append({
+                            spot_positions.append({
+                                "asset": asset,
                                 "symbol": symbol,
                                 "side": "LONG",
                                 "quantity": total,
-                                # 现货平均成本需要逐个拉成交历史，接口会非常慢。
-                                # 看板先返回可用持仓和现价，成本后续再异步优化。
-                                "entry_price": 0.0,
                                 "unrealized_pnl": 0,
                                 "market_type": "SPOT",
                             })
+
+                if not spot_positions:
+                    return []
+
+                entry_prices = await asyncio.gather(
+                    *[
+                        self._get_average_entry_price(
+                            client,
+                            position["symbol"],
+                            position["asset"],
+                            position["quantity"],
+                        )
+                        for position in spot_positions
+                    ],
+                    return_exceptions=True,
+                )
+
+                result = []
+                for position, entry_price in zip(spot_positions, entry_prices):
+                    resolved_entry_price = 0.0
+                    if isinstance(entry_price, Exception):
+                        logger.warning(
+                            "Failed to calculate spot entry price for %s",
+                            position["symbol"],
+                            exc_info=entry_price,
+                        )
+                    else:
+                        resolved_entry_price = float(entry_price or 0.0)
+
+                    result.append({
+                        "symbol": position["symbol"],
+                        "side": position["side"],
+                        "quantity": position["quantity"],
+                        "entry_price": resolved_entry_price,
+                        "unrealized_pnl": position["unrealized_pnl"],
+                        "market_type": position["market_type"],
+                    })
                 return result
         except Exception as e:
             logger.exception("Error getting live positions")
@@ -353,40 +390,70 @@ class TradeService:
         finally:
             await client.close()
 
-    async def _get_average_entry_price(self, client: BinanceClient, symbol: str, asset: str) -> float:
-        """从历史成交计算平均成本"""
-        try:
-            from datetime import datetime, timedelta
-            end_time = int(datetime.now().timestamp() * 1000)
-            start_time = int((datetime.now() - timedelta(days=90)).timestamp() * 1000)
+    def _calculate_spot_cost_basis(self, trades: list[dict], asset: str) -> tuple[float, float]:
+        """根据现货成交历史计算当前剩余持仓的成本和数量"""
+        total_cost = 0.0
+        total_quantity = 0.0
 
-            trades = await client.get_my_trades(symbol=symbol, start_time=start_time, end_time=end_time)
-            # ... (后续计算逻辑保持不变，但已经是异步获取数据)
+        for trade in sorted(trades, key=lambda item: item.get("time", 0)):
+            raw_qty = float(trade.get("qty", 0))
+            quote_qty = float(trade.get("quoteQty", 0))
+            commission = float(trade.get("commission", 0))
+            commission_asset = trade.get("commissionAsset", "")
+
+            if raw_qty <= 0:
+                continue
+
+            if trade.get("isBuyer", False):
+                net_qty = raw_qty - commission if commission_asset == asset else raw_qty
+                if net_qty <= 0:
+                    continue
+                total_quantity += net_qty
+                total_cost += quote_qty + (commission if commission_asset == "USDT" else 0.0)
+            else:
+                sell_qty = raw_qty + (commission if commission_asset == asset else 0.0)
+                if total_quantity <= 0 or sell_qty <= 0:
+                    continue
+
+                sold_qty = min(sell_qty, total_quantity)
+                avg_cost_per_unit = total_cost / total_quantity if total_quantity > 0 else 0.0
+                total_cost -= avg_cost_per_unit * sold_qty
+                total_quantity -= sold_qty
+
+                if total_quantity <= 1e-12:
+                    total_cost = 0.0
+                    total_quantity = 0.0
+
+        return total_cost, total_quantity
+
+    async def _get_average_entry_price(
+        self,
+        client: BinanceClient,
+        symbol: str,
+        asset: str,
+        current_quantity: float,
+    ) -> float:
+        """从最近成交历史计算平均成本"""
+        try:
+            trades = await client.get_my_trades(symbol=symbol, limit=RECENT_SPOT_TRADES_LIMIT)
 
             if not trades:
-                # 如果没有成交记录，返回0，让前端用当前价格显示
                 return 0.0
 
-            total_cost = 0.0
-            total_quantity = 0.0
+            total_cost, total_quantity = self._calculate_spot_cost_basis(trades, asset)
+            quantity_tolerance = max(current_quantity * 0.01, 1e-8)
 
-            for trade in trades:
-                # BUY 交易增加持仓
-                if trade.get("isBuyer", False):
-                    total_cost += float(trade.get("quoteQty", 0))
-                    total_quantity += float(trade.get("qty", 0))
-                # SELL 交易减少持仓（使用平均成本计算）
-                else:
-                    sold_qty = float(trade.get("qty", 0))
-                    quoteQty = float(trade.get("quoteQty", 0))
-                    avg_cost_per_unit = total_cost / total_quantity if total_quantity > 0 else 0
-                    # 正确计算：加上卖出所得，减去卖出部分的成本
-                    total_cost = total_cost + quoteQty - avg_cost_per_unit * sold_qty
-                    total_quantity -= sold_qty
-
-            if total_quantity > 0:
+            if total_quantity > 0 and abs(total_quantity - current_quantity) <= quantity_tolerance:
                 return total_cost / total_quantity
+
+            logger.info(
+                "Spot entry price unavailable for %s: trade_qty=%s current_qty=%s recent_trades=%s",
+                symbol,
+                total_quantity,
+                current_quantity,
+                len(trades),
+            )
             return 0.0
         except Exception as e:
-            print(f"[Trade] Error getting average entry price for {symbol}: {e}")
+            logger.warning("Error getting average entry price for %s (%s): %s", symbol, asset, e)
             return 0.0

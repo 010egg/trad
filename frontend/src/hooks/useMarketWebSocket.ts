@@ -3,6 +3,21 @@ import { useMarketStore } from '@/stores/useMarketStore'
 
 const FALLBACK_POLL_MS = 2000
 const FALLBACK_IDLE_MS = 5000
+const RECONNECT_IDLE_MS = 8000
+const RECONNECT_THROTTLE_MS = 4000
+
+function buildWsCandidates() {
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
+  const candidates = [`${protocol}://${window.location.host}/ws/market`]
+
+  if (window.location.port === '5173') {
+    candidates.push(`${protocol}://${window.location.hostname}:8000/ws/market`)
+    candidates.push(`${protocol}://127.0.0.1:8000/ws/market`)
+    candidates.push(`${protocol}://localhost:8000/ws/market`)
+  }
+
+  return [...new Set(candidates)]
+}
 
 export function useMarketWebSocket() {
   const symbol = useMarketStore((state) => state.symbol)
@@ -12,6 +27,9 @@ export function useMarketWebSocket() {
   const wsRef = useRef<WebSocket | null>(null)
   const backoffRef = useRef(500)
   const lastRealtimeRef = useRef(0)
+  const lastReconnectRef = useRef(0)
+  const reconnectReasonRef = useRef<'close' | 'stale'>('close')
+  const candidateIndexRef = useRef(0)
   const symbolRef = useRef(symbol)
   const intervalRef = useRef(interval)
 
@@ -32,23 +50,39 @@ export function useMarketWebSocket() {
   useEffect(() => {
     let cancelled = false
     let timer: ReturnType<typeof setTimeout> | null = null
+    const wsCandidates = buildWsCandidates()
+
+    const scheduleReconnect = (reason: 'close' | 'stale') => {
+      const now = Date.now()
+      if (now - lastReconnectRef.current < RECONNECT_THROTTLE_MS) {
+        return
+      }
+
+      lastReconnectRef.current = now
+      reconnectReasonRef.current = reason
+      lastRealtimeRef.current = 0
+      wsRef.current?.close()
+    }
 
     const pollTimer = setInterval(() => {
       const inactiveMs = Date.now() - lastRealtimeRef.current
       if (lastRealtimeRef.current === 0 || inactiveMs >= FALLBACK_IDLE_MS) {
         void syncLatestKlines(symbolRef.current, intervalRef.current)
       }
+      if (inactiveMs >= RECONNECT_IDLE_MS) {
+        scheduleReconnect('stale')
+      }
     }, FALLBACK_POLL_MS)
 
     function connect() {
       if (cancelled) return
 
-      const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
-      const ws = new WebSocket(`${protocol}://${window.location.host}/ws/market`)
+      const target = wsCandidates[candidateIndexRef.current] || wsCandidates[0]
+      const ws = new WebSocket(target)
       wsRef.current = ws
 
       ws.onopen = () => {
-        console.log('[WS] Connected')
+        console.log(`[WS] Connected: ${target}`)
         backoffRef.current = 500
         ws.send(JSON.stringify({ action: 'subscribe', symbol: symbolRef.current, interval: intervalRef.current }))
       }
@@ -62,6 +96,7 @@ export function useMarketWebSocket() {
           }
           if (msg.type === 'kline') {
             lastRealtimeRef.current = Date.now()
+            candidateIndexRef.current = 0
             const { symbol: msgSymbol, ...kline } = msg.data
             // 只有当推送的 symbol 与当前 refs 中的 symbol 匹配时才更新
             if (msgSymbol && msgSymbol !== symbolRef.current) return
@@ -75,8 +110,12 @@ export function useMarketWebSocket() {
 
       ws.onclose = () => {
         if (cancelled) return
+        if (reconnectReasonRef.current === 'stale' && wsCandidates.length > 1) {
+          candidateIndexRef.current = (candidateIndexRef.current + 1) % wsCandidates.length
+        }
         console.log(`[WS] Disconnected, reconnecting in ${backoffRef.current / 1000}s`)
         timer = setTimeout(() => {
+          reconnectReasonRef.current = 'close'
           backoffRef.current = Math.min(backoffRef.current * 2, 5000)
           connect()
         }, backoffRef.current)
