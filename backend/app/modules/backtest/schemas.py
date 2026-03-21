@@ -56,9 +56,17 @@ class BacktestRequest(BaseModel):
     take_profit_pct: float = 6.0
     risk_per_trade: float = 2.0
     leverage: int = 1
-    strategy_mode: str = "long_only"  # long_only, short_only, bidirectional
+    strategy_mode: str = "long_only"  # long_only, short_only, bidirectional, dca, martingale
     name: str | None = None
     include_trades: bool = True  # False 时跳过返回交易列表，减少响应体积
+    # DCA（定投）专用参数
+    dca_interval_bars: int = 24  # 每隔多少根K线买入一次
+    dca_amount: float = 100.0  # 每次定投金额（USDT）
+    dca_take_profit_pct: float | None = None  # 可选：累计盈利达到此百分比时全部卖出
+    # 马丁格尔专用参数
+    martingale_multiplier: float = 2.0  # 亏损后仓位倍数
+    martingale_max_rounds: int = 4  # 最大连续加倍次数
+    martingale_reset_on_win: bool = True  # 盈利后是否重置为基础仓位
     # 兼容旧接口
     entry_indicator: str | None = None
     entry_fast: int | None = None
@@ -105,6 +113,11 @@ class BacktestResult(BaseModel):
     profit_factor: float
     max_drawdown: float
     sharpe_ratio: float
+    calmar_ratio: float = 0
+    max_consecutive_losses: int = 0
+    max_dd_duration_hours: float = 0
+    sortino_ratio: float = 0
+    tail_ratio: float = 0
     total_trades: int
     avg_holding_hours: float
     trades: list[BacktestTradeItem]
@@ -122,15 +135,26 @@ class BacktestRecordResponse(BaseModel):
     stop_loss_pct: float
     take_profit_pct: float
     risk_per_trade: float
+    position_pct: float = 0.0
+    strategy_mode: str = "long_only"
     total_return_pct: float
     final_balance: float
     win_rate: float
     profit_factor: float
     max_drawdown: float
     sharpe_ratio: float
+    calmar_ratio: float = 0
+    max_consecutive_losses: int = 0
+    max_dd_duration_hours: float = 0
+    sortino_ratio: float = 0
+    tail_ratio: float = 0
     total_trades: int
     avg_holding_hours: float
+    is_favorite: bool = False
+    tags: list[str] = []
     created_at: str
+
+    model_config = {"exclude_none": False}
 
 
 class BacktestRecordDetail(BacktestRecordResponse):
@@ -141,6 +165,10 @@ class BacktestRecordDetail(BacktestRecordResponse):
 
 class BacktestRecordUpdate(BaseModel):
     name: str
+
+
+class BacktestRecordTagsUpdate(BaseModel):
+    tags: list[str]
 
 
 class BatchBacktestRequest(BaseModel):

@@ -1,18 +1,21 @@
 import { useEffect, useState } from 'react'
+import { useLocation } from 'react-router'
 import { MainLayout } from '@/layouts/MainLayout'
+import api from '@/lib/api'
 import { useRiskStore } from '@/stores/useRiskStore'
 import { useTradeStore } from '@/stores/useTradeStore'
 
-type Tab = 'risk' | 'trade'
+type Tab = 'basic' | 'risk' | 'trade'
 
 export function SettingsPage() {
+  const location = useLocation()
   const config = useRiskStore((state) => state.config)
   const fetchConfig = useRiskStore((state) => state.fetchConfig)
   const updateConfig = useRiskStore((state) => state.updateConfig)
   const settings = useTradeStore((state) => state.settings)
   const fetchSettings = useTradeStore((state) => state.fetchSettings)
   const updateSettings = useTradeStore((state) => state.updateSettings)
-  const [activeTab, setActiveTab] = useState<Tab>('risk')
+  const [activeTab, setActiveTab] = useState<Tab>('basic')
 
   // 风控设置状态
   const [maxLoss, setMaxLoss] = useState(2)
@@ -27,11 +30,28 @@ export function SettingsPage() {
   const [tradeMode, setTradeMode] = useState('SIMULATED')
   const [defaultMarket, setDefaultMarket] = useState('SPOT')
   const [defaultLeverage, setDefaultLeverage] = useState(1)
+  const [llmEnabled, setLlmEnabled] = useState(false)
+  const [llmProvider, setLlmProvider] = useState<'OPENAI' | 'ANTHROPIC'>('OPENAI')
+  const [llmBaseUrl, setLlmBaseUrl] = useState('')
+  const [llmModel, setLlmModel] = useState('minimax')
+  const [llmSystemPrompt, setLlmSystemPrompt] = useState('')
+  const [llmApiKey, setLlmApiKey] = useState('')
+  const [llmHasApiKey, setLlmHasApiKey] = useState(false)
+  const [llmApiKeyMasked, setLlmApiKeyMasked] = useState<string | null>(null)
+  const [clearLlmApiKey, setClearLlmApiKey] = useState(false)
+  const [llmTesting, setLlmTesting] = useState(false)
+  const [llmTestError, setLlmTestError] = useState('')
+  const [llmTestSuccess, setLlmTestSuccess] = useState('')
 
   useEffect(() => {
     if (!config) void fetchConfig()
     if (!settings) void fetchSettings()
   }, [config, settings, fetchConfig, fetchSettings])
+
+  useEffect(() => {
+    if (location.pathname !== '/settings') return
+    void fetchSettings()
+  }, [location.pathname, fetchSettings])
 
   useEffect(() => {
     if (config) {
@@ -49,6 +69,15 @@ export function SettingsPage() {
       setTradeMode(settings.trade_mode)
       setDefaultMarket(settings.default_market)
       setDefaultLeverage(settings.default_leverage)
+      setLlmEnabled(settings.llm_enabled)
+      setLlmProvider((settings.llm_provider as 'OPENAI' | 'ANTHROPIC') || 'OPENAI')
+      setLlmBaseUrl(settings.llm_base_url)
+      setLlmModel(settings.llm_model)
+      setLlmSystemPrompt(settings.llm_system_prompt || '')
+      setLlmHasApiKey(settings.llm_has_api_key)
+      setLlmApiKeyMasked(settings.llm_api_key_masked)
+      setLlmApiKey('')
+      setClearLlmApiKey(false)
     }
   }, [settings])
 
@@ -72,12 +101,82 @@ export function SettingsPage() {
     setTimeout(() => setSaved(false), 2000)
   }
 
+  const handleSaveBasic = async () => {
+    await updateSettings({
+      llm_enabled: llmEnabled,
+      llm_provider: llmProvider,
+      llm_base_url: llmBaseUrl.trim(),
+      llm_model: llmModel.trim() || 'minimax',
+      llm_system_prompt: llmSystemPrompt.trim(),
+      ...(clearLlmApiKey ? { llm_api_key: '' } : {}),
+      ...(llmApiKey.trim() ? { llm_api_key: llmApiKey.trim() } : {}),
+    })
+    setLlmApiKey('')
+    setClearLlmApiKey(false)
+    setSaved(true)
+    setTimeout(() => setSaved(false), 2000)
+  }
+
+  const handleToggleLlmEnabled = async () => {
+    const nextValue = !llmEnabled
+    setLlmEnabled(nextValue)
+    try {
+      await updateSettings({ llm_enabled: nextValue })
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2000)
+    } catch {
+      setLlmEnabled(!nextValue)
+    }
+  }
+
+  const handleTestLlmConnection = async () => {
+    setLlmTesting(true)
+    setLlmTestError('')
+    setLlmTestSuccess('')
+
+    try {
+      const baseUrl = llmBaseUrl.trim()
+      const model = llmModel.trim() || 'minimax'
+      const apiKey = llmApiKey.trim()
+      const useSavedApiKey = !clearLlmApiKey && !apiKey && llmHasApiKey
+
+      const result: {
+        success: boolean
+        latency_ms: number
+        model: string
+        preview: string
+      } = await api.post('/trade/settings/llm-test', {
+        provider: llmProvider,
+        base_url: baseUrl,
+        model,
+        ...(apiKey ? { api_key: apiKey } : {}),
+        use_saved_api_key: useSavedApiKey,
+      })
+
+      setLlmTestSuccess(`联通成功，${result.model} 响应 ${result.preview}，耗时 ${result.latency_ms}ms`)
+    } catch (error: any) {
+      setLlmTestError(error.response?.data?.detail || error.message || '联通性测试失败')
+    } finally {
+      setLlmTesting(false)
+    }
+  }
+
   return (
     <MainLayout>
       <div className="flex h-full">
         {/* 侧栏 */}
         <div className="w-[200px] bg-[var(--color-bg-card)] border-r border-[var(--color-border)] py-4">
           <div className="space-y-1">
+            <button
+              onClick={() => setActiveTab('basic')}
+              className={`w-full flex items-center gap-2 px-4 py-2 text-sm no-underline transition-colors ${
+                activeTab === 'basic'
+                  ? 'text-[var(--color-accent)] bg-[rgba(88,166,255,0.12)] border-l-2 border-[var(--color-accent)]'
+                  : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
+              }`}
+            >
+              基础设置
+            </button>
             <button
               onClick={() => setActiveTab('risk')}
               className={`w-full flex items-center gap-2 px-4 py-2 text-sm no-underline transition-colors ${
@@ -103,6 +202,149 @@ export function SettingsPage() {
 
         {/* 主内容 */}
         <div className="flex-1 overflow-y-auto p-8 max-w-[720px]">
+          {activeTab === 'basic' && (
+            <>
+              <div className="mb-8 pb-6 border-b border-[var(--color-border)]">
+                <h1 className="text-2xl font-semibold mb-1">基础设置</h1>
+                <p className="text-sm text-[var(--color-text-secondary)]">管理系统级接入能力和全局行为，不和交易参数混在一起。</p>
+              </div>
+
+              <div className="mb-8">
+                <h2 className="text-lg font-semibold mb-4 pb-2 border-b border-[var(--color-border)]">AI 情报接入</h2>
+                <div className="flex items-center justify-between py-4 border-b border-[var(--color-border)]">
+                  <div className="flex-1 mr-6">
+                    <div className="font-medium mb-0.5">启用 AI 摘要与打分</div>
+                    <div className="text-xs text-[var(--color-text-disabled)]">用于情报页的摘要、方向判断和置信度输出，不会自动下单。</div>
+                  </div>
+                  <div
+                    onClick={() => void handleToggleLlmEnabled()}
+                    className={`w-10 h-[22px] rounded-full relative cursor-pointer transition-colors ${llmEnabled ? 'bg-[var(--color-accent)]' : 'bg-[var(--color-bg-input)] border border-[var(--color-border)]'}`}
+                  >
+                    <div className={`absolute top-[2px] w-4 h-4 rounded-full bg-white transition-transform ${llmEnabled ? 'right-[2px]' : 'left-[2px]'}`} />
+                  </div>
+                </div>
+
+                <div className="py-4 border-b border-[var(--color-border)]">
+                  <div className="font-medium mb-1">协议</div>
+                  <div className="text-xs text-[var(--color-text-disabled)] mb-3">MiniMax 官方推荐 Anthropic 兼容协议；如果你用的是 OpenAI SDK 生态，也可以切到 OpenAI 兼容。</div>
+                  <select
+                    value={llmProvider}
+                    onChange={(e) => setLlmProvider(e.target.value as 'OPENAI' | 'ANTHROPIC')}
+                    className="font-[var(--font-mono)]"
+                  >
+                    <option value="ANTHROPIC">Anthropic Compatible</option>
+                    <option value="OPENAI">OpenAI Compatible</option>
+                  </select>
+                </div>
+
+                <div className="py-4 border-b border-[var(--color-border)]">
+                  <div className="font-medium mb-1">Base URL</div>
+                  <div className="text-xs text-[var(--color-text-disabled)] mb-3">
+                    {llmProvider === 'ANTHROPIC'
+                      ? '中国站：`https://api.minimaxi.com/anthropic`，国际站：`https://api.minimax.io/anthropic`'
+                      : '中国站：`https://api.minimaxi.com/v1`，国际站：`https://api.minimax.io/v1`'}
+                  </div>
+                  <input
+                    value={llmBaseUrl}
+                    onChange={(e) => setLlmBaseUrl(e.target.value)}
+                    placeholder={llmProvider === 'ANTHROPIC' ? 'https://api.minimaxi.com/anthropic' : 'https://api.minimaxi.com/v1'}
+                    className="font-[var(--font-mono)]"
+                  />
+                </div>
+
+                <div className="py-4 border-b border-[var(--color-border)]">
+                  <div className="font-medium mb-1">模型名称</div>
+                  <div className="text-xs text-[var(--color-text-disabled)] mb-3">
+                    {llmProvider === 'ANTHROPIC'
+                      ? 'Anthropic 兼容可用例如 `MiniMax-M2.7`。'
+                      : 'OpenAI 兼容可用例如 `MiniMax-M2.5`。'}
+                  </div>
+                  <input
+                    value={llmModel}
+                    onChange={(e) => setLlmModel(e.target.value)}
+                    placeholder={llmProvider === 'ANTHROPIC' ? 'MiniMax-M2.7' : 'MiniMax-M2.5'}
+                    className="font-[var(--font-mono)]"
+                  />
+                </div>
+
+                <div className="py-4">
+                  <div className="font-medium mb-1">系统提示词</div>
+                  <div className="text-xs text-[var(--color-text-disabled)] mb-3">
+                    这里就是实际发给模型的唯一系统提示词来源。情报摘要和 AI 对话都会直接使用它，用户只从这里维护。
+                  </div>
+                  <textarea
+                    value={llmSystemPrompt}
+                    onChange={(e) => setLlmSystemPrompt(e.target.value)}
+                    rows={5}
+                    placeholder="例如：全部用中文。先给一句话结论，再写影响逻辑、风险点、观察清单。偏谨慎，不要给绝对化判断。"
+                    className="w-full rounded-md border border-[var(--color-border)] bg-[var(--color-bg-input)] px-3 py-2 text-sm leading-relaxed text-[var(--color-text-primary)] outline-none transition-colors focus:border-[var(--color-accent)]"
+                  />
+                  <div className="mt-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-card)] px-3 py-2 text-xs leading-6 text-[var(--color-text-secondary)]">
+                    提示：摘要是否返回 JSON、聊天是否按结构回答，这些格式要求会跟随每次具体任务一起下发；系统级人格和风格只看这里这一份。
+                  </div>
+                </div>
+
+                <div className="py-4">
+                  <div className="flex items-center justify-between gap-3 mb-1">
+                    <div className="font-medium">API Key</div>
+                    {llmHasApiKey && !clearLlmApiKey && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setClearLlmApiKey(true)
+                          setLlmApiKey('')
+                        }}
+                        className="text-xs font-bold text-[var(--color-short)] hover:underline"
+                      >
+                        清空已保存密钥
+                      </button>
+                    )}
+                  </div>
+                  <div className="text-xs text-[var(--color-text-disabled)] mb-3">
+                    {clearLlmApiKey
+                      ? '保存后将移除已存密钥。'
+                      : llmHasApiKey
+                        ? `当前已保存：${llmApiKeyMasked || '***'}，留空则保持不变。`
+                        : '未保存密钥。'}
+                  </div>
+                  <input
+                    type="password"
+                    value={llmApiKey}
+                    onChange={(e) => {
+                      setLlmApiKey(e.target.value)
+                      if (clearLlmApiKey) setClearLlmApiKey(false)
+                    }}
+                    placeholder={llmHasApiKey && !clearLlmApiKey ? '留空则保留当前密钥' : '输入 API Key'}
+                    className="font-[var(--font-mono)]"
+                  />
+
+                  <div className="mt-4 flex items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => void handleTestLlmConnection()}
+                      disabled={llmTesting}
+                      className="px-3 py-2 rounded border border-[var(--color-border)] text-sm text-[var(--color-text-primary)] bg-[var(--color-bg-card)] cursor-pointer hover:border-[var(--color-accent)] disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {llmTesting ? '测试中...' : '测试联通性'}
+                    </button>
+                    <span className="text-xs text-[var(--color-text-disabled)]">直接使用当前表单内容测试，不要求先保存；总开关会立即保存。</span>
+                  </div>
+
+                  {llmTestSuccess && (
+                    <div className="mt-3 rounded-lg border border-[var(--color-long)]/20 bg-[var(--color-long)]/10 px-3 py-2 text-sm text-[var(--color-long)]">
+                      {llmTestSuccess}
+                    </div>
+                  )}
+                  {llmTestError && (
+                    <div className="mt-3 rounded-lg border border-[var(--color-short)]/20 bg-[var(--color-short)]/10 px-3 py-2 text-sm text-[var(--color-short)]">
+                      {llmTestError}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+
           {activeTab === 'risk' && (
             <>
               <h1 className="text-2xl font-semibold mb-1">风控设置</h1>
@@ -281,10 +523,10 @@ export function SettingsPage() {
           <div className="sticky bottom-0 bg-[var(--color-bg-card)] border-t border-[var(--color-border)] py-4 flex justify-end gap-2">
             {saved && <span className="text-sm text-[var(--color-long)] self-center mr-2">✓ 已保存</span>}
             <button
-              onClick={activeTab === 'risk' ? handleSaveRisk : handleSaveTrade}
+              onClick={activeTab === 'basic' ? handleSaveBasic : activeTab === 'risk' ? handleSaveRisk : handleSaveTrade}
               className="px-4 py-2 bg-[var(--color-accent)] text-white rounded cursor-pointer hover:opacity-90 border-none"
             >
-              保存设置
+              {activeTab === 'basic' ? '保存基础设置' : activeTab === 'risk' ? '保存风控设置' : '保存交易设置'}
             </button>
           </div>
         </div>

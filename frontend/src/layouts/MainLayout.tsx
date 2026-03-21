@@ -3,6 +3,8 @@ import { Link, useLocation } from 'react-router'
 import { useAuthStore } from '@/stores/useAuthStore'
 import { useTradeStore } from '@/stores/useTradeStore'
 import { useAccountStore } from '@/stores/useAccountStore'
+import { useIntelAiStore } from '@/stores/useIntelAiStore'
+import { BrandMark, BrandWordmark } from '@/components/BrandMark'
 
 export function MainLayout({ children }: { children: React.ReactNode }) {
   const location = useLocation()
@@ -12,10 +14,12 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
   const fetchSettings = useTradeStore((state) => state.fetchSettings)
   const updateSettings = useTradeStore((state) => state.updateSettings)
   const fetchPositions = useAccountStore((state) => state.fetchPositions)
+  const intelAiOpen = useIntelAiStore((state) => state.open)
   const [switchingMarket, setSwitchingMarket] = useState<'SPOT' | 'FUTURES' | null>(null)
 
   const links = [
     { path: '/', label: '行情看板' },
+    { path: '/intel', label: '情报' },
     { path: '/backtest', label: '回测' },
     { path: '/settings', label: '设置' },
   ]
@@ -46,9 +50,9 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
     <div className="flex flex-col h-full overflow-hidden">
       <nav className="flex items-center justify-between px-6 h-12 bg-[var(--color-bg-card)] border-b border-[var(--color-border)] shrink-0 z-50">
         <div className="flex items-center gap-6">
-          <Link to="/" className="flex items-center gap-2 text-[var(--color-text-primary)] font-semibold no-underline">
-            <div className="w-6 h-6 bg-[var(--color-accent)] rounded text-white text-xs font-bold flex items-center justify-center">T</div>
-            TradeGuard
+          <Link to="/" className="flex items-center gap-2.5 text-[var(--color-text-primary)] no-underline">
+            <BrandMark className="h-8 w-8 shrink-0" />
+            <BrandWordmark />
           </Link>
           <div className="flex gap-1">
             {links.map((l) => (
@@ -107,7 +111,9 @@ export function MainLayout({ children }: { children: React.ReactNode }) {
           </div>
         </div>
       </nav>
-      <div className="flex-1 overflow-hidden">{children}</div>
+      <div className={`flex-1 overflow-hidden transition-[padding-right] duration-300 ${intelAiOpen ? 'xl:pr-[472px]' : ''}`}>
+        {children}
+      </div>
     </div>
   )
 }

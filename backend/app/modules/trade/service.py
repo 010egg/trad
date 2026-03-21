@@ -3,7 +3,8 @@
 import asyncio
 import logging
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
+from urllib.parse import urlparse
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,11 +14,14 @@ from app.modules.trade.schemas import CreateOrderRequest
 from app.modules.risk.service import check_single_trade_risk, get_or_create_config
 from app.modules.risk.service import check_daily_loss_circuit
 from app.modules.binance.client import BinanceClient
-from app.modules.account.service import decrypt_value
+from app.modules.account.service import decrypt_value, encrypt_value, mask_key
 from app.modules.trade.models import ApiKey
+from app.modules.intel.prompts import get_default_intel_system_prompt
 
 logger = logging.getLogger(__name__)
 RECENT_SPOT_TRADES_LIMIT = 1000
+LLM_PROVIDER_VALUES = {"OPENAI", "ANTHROPIC"}
+MINIMAX_API_HOSTS = {"api.minimax.io", "api.minimax.chat", "api.minimaxi.com"}
 
 
 class TradeService:
@@ -45,6 +49,10 @@ class TradeService:
             self.db.add(self._settings)
             await self.db.commit()
             await self.db.refresh(self._settings)
+        elif not (self._settings.llm_system_prompt or "").strip():
+            self._settings.llm_system_prompt = get_default_intel_system_prompt()
+            await self.db.commit()
+            await self.db.refresh(self._settings)
         return self._settings
 
     async def update_trade_settings(
@@ -52,6 +60,12 @@ class TradeService:
         trade_mode: Optional[str] = None,
         default_market: Optional[str] = None,
         default_leverage: Optional[int] = None,
+        llm_enabled: Optional[bool] = None,
+        llm_provider: Optional[str] = None,
+        llm_base_url: Optional[str] = None,
+        llm_model: Optional[str] = None,
+        llm_system_prompt: Optional[str] = None,
+        llm_api_key: Optional[str] = None,
     ) -> TradeSettings:
         """更新交易设置"""
         settings = await self.get_trade_settings()
@@ -68,6 +82,31 @@ class TradeService:
 
         if default_leverage is not None:
             settings.default_leverage = default_leverage
+
+        if llm_enabled is not None:
+            settings.llm_enabled = llm_enabled
+
+        if llm_provider is not None:
+            llm_provider = llm_provider.strip().upper()
+            if llm_provider not in LLM_PROVIDER_VALUES:
+                raise ValueError("Invalid LLM provider")
+            settings.llm_provider = llm_provider
+
+        if llm_base_url is not None:
+            settings.llm_base_url = normalize_llm_base_url(
+                settings.llm_provider or "OPENAI",
+                llm_base_url,
+            )
+
+        if llm_model is not None:
+            settings.llm_model = (llm_model.strip() or "minimax")
+
+        if llm_system_prompt is not None:
+            settings.llm_system_prompt = llm_system_prompt.strip() or get_default_intel_system_prompt()
+
+        if llm_api_key is not None:
+            llm_api_key = llm_api_key.strip()
+            settings.llm_api_key_enc = encrypt_value(llm_api_key) if llm_api_key else None
 
         await self.db.commit()
         await self.db.refresh(settings)
@@ -457,3 +496,83 @@ class TradeService:
         except Exception as e:
             logger.warning("Error getting average entry price for %s (%s): %s", symbol, asset, e)
             return 0.0
+
+
+def serialize_trade_settings(settings: TradeSettings) -> dict[str, Any]:
+    masked_api_key = None
+    has_api_key = bool(settings.llm_api_key_enc)
+
+    if has_api_key:
+        try:
+            masked_api_key = mask_key(decrypt_value(settings.llm_api_key_enc))
+        except Exception:
+            masked_api_key = "***"
+
+    return {
+        "trade_mode": settings.trade_mode,
+        "default_market": settings.default_market,
+        "default_leverage": settings.default_leverage,
+        "llm_enabled": settings.llm_enabled,
+        "llm_provider": settings.llm_provider or "OPENAI",
+        "llm_base_url": normalize_llm_base_url(settings.llm_provider or "OPENAI", settings.llm_base_url or ""),
+        "llm_model": settings.llm_model or "minimax",
+        "llm_system_prompt": settings.llm_system_prompt or get_default_intel_system_prompt(),
+        "llm_has_api_key": has_api_key,
+        "llm_api_key_masked": masked_api_key,
+    }
+
+
+def has_custom_llm_settings(settings: TradeSettings) -> bool:
+    return bool(settings.llm_enabled or settings.llm_base_url or settings.llm_api_key_enc)
+
+
+def build_user_llm_runtime_config(settings: TradeSettings) -> dict[str, str] | None:
+    if not settings.llm_enabled:
+        return None
+    if not settings.llm_base_url or not settings.llm_model or not settings.llm_api_key_enc:
+        return None
+
+    try:
+        api_key = decrypt_value(settings.llm_api_key_enc)
+    except Exception:
+        return None
+
+    return {
+        "provider": settings.llm_provider or "OPENAI",
+        "base_url": normalize_llm_base_url(settings.llm_provider or "OPENAI", settings.llm_base_url),
+        "model": settings.llm_model,
+        "system_prompt": settings.llm_system_prompt.strip() or get_default_intel_system_prompt(),
+        "api_key": api_key,
+    }
+
+
+def normalize_llm_base_url(provider: str, base_url: str) -> str:
+    provider = (provider or "OPENAI").strip().upper()
+    base_url = (base_url or "").strip().rstrip("/")
+    if not base_url:
+        return ""
+
+    parsed = urlparse(base_url)
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+
+    if host in MINIMAX_API_HOSTS:
+        if provider == "ANTHROPIC":
+            normalized_path = path.rstrip("/")
+            if normalized_path.endswith("/v1/messages"):
+                normalized_path = normalized_path[:-len("/v1/messages")]
+            elif normalized_path.endswith("/messages"):
+                normalized_path = normalized_path[:-len("/messages")]
+            if normalized_path.endswith("/v1"):
+                normalized_path = normalized_path[:-len("/v1")]
+            if path in {"", "/"}:
+                return f"{parsed.scheme}://{parsed.netloc}/anthropic"
+            if normalized_path:
+                return f"{parsed.scheme}://{parsed.netloc}{normalized_path}"
+        if provider == "OPENAI":
+            if path in {"", "/"}:
+                return f"{parsed.scheme}://{parsed.netloc}/v1"
+            if path.endswith("/chat/completions"):
+                return f"{parsed.scheme}://{parsed.netloc}{path[:-len('/chat/completions')]}"
+
+    return base_url

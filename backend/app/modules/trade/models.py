@@ -59,5 +59,11 @@ class TradeSettings(Base):
     trade_mode: Mapped[str] = mapped_column(String(20), default="SIMULATED")  # SIMULATED / LIVE
     default_market: Mapped[str] = mapped_column(String(10), default="SPOT")  # SPOT / FUTURES
     default_leverage: Mapped[int] = mapped_column(Integer, default=1)
+    llm_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    llm_provider: Mapped[str] = mapped_column(String(20), default="OPENAI", server_default="OPENAI")
+    llm_base_url: Mapped[str] = mapped_column(String(500), default="")
+    llm_model: Mapped[str] = mapped_column(String(120), default="minimax", server_default="minimax")
+    llm_system_prompt: Mapped[str] = mapped_column(Text, default="", server_default="")
+    llm_api_key_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())

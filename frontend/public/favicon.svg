@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <!-- Background -->
+  <rect width="200" height="200" rx="40" fill="#1a2a2a"/>
+
+  <!-- Left antenna -->
+  <line x1="82" y1="42" x2="74" y2="22" stroke="#D4621A" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="73" cy="19" r="5" fill="#E8722A"/>
+
+  <!-- Right antenna -->
+  <line x1="118" y1="42" x2="126" y2="22" stroke="#D4621A" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="127" cy="19" r="5" fill="#E8722A"/>
+
+  <!-- Left arm -->
+  <circle cx="56" cy="108" r="18" fill="#D4621A"/>
+
+  <!-- Right arm -->
+  <circle cx="144" cy="108" r="18" fill="#D4621A"/>
+
+  <!-- Main body -->
+  <circle cx="100" cy="100" r="52" fill="#E8722A"/>
+
+  <!-- Left eye white -->
+  <circle cx="84" cy="92" r="10" fill="#1a2a2a"/>
+  <!-- Left eye pupil -->
+  <circle cx="84" cy="92" r="6" fill="#00CED1"/>
+  <circle cx="84" cy="92" r="2.5" fill="#005f6b"/>
+
+  <!-- Right eye white -->
+  <circle cx="116" cy="92" r="10" fill="#1a2a2a"/>
+  <!-- Right eye pupil -->
+  <circle cx="116" cy="92" r="6" fill="#00CED1"/>
+  <circle cx="116" cy="92" r="2.5" fill="#005f6b"/>
+
+  <!-- Letter T in the middle -->
+  <text x="100" y="126" font-family="Arial, sans-serif" font-size="32" font-weight="bold" fill="white" text-anchor="middle" dominant-baseline="middle">T</text>
+
+  <!-- Left leg -->
+  <rect x="83" y="148" width="12" height="18" rx="4" fill="#D4621A"/>
+
+  <!-- Right leg -->
+  <rect x="105" y="148" width="12" height="18" rx="4" fill="#D4621A"/>
+</svg>

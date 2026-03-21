@@ -7,8 +7,10 @@ import { LoginPage } from '@/pages/LoginPage'
 import { RegisterPage } from '@/pages/RegisterPage'
 import { SetupPage } from '@/pages/SetupPage'
 import { DashboardPage } from '@/pages/DashboardPage'
+import { IntelPage } from '@/pages/IntelPage'
 import { BacktestPage } from '@/pages/BacktestPage'
 import { SettingsPage } from '@/pages/SettingsPage'
+import { IntelAiDialog } from '@/features/intel/IntelAiDialog'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated)
@@ -18,7 +20,7 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
 
 // 主页面 keep-alive：首次访问时挂载，之后保持不销毁，切换只改变可见性
 // 使用 visibility 而非 display:none，保留 DOM 尺寸让图表不需要重新计算
-const KEEPALIVE_PATHS = ['/', '/backtest', '/settings'] as const
+const KEEPALIVE_PATHS = ['/', '/intel', '/backtest', '/settings'] as const
 type KeepalivePath = typeof KEEPALIVE_PATHS[number]
 
 function KeepAliveRoutes() {
@@ -51,11 +53,17 @@ function KeepAliveRoutes() {
           <BacktestPage />
         </PageSlot>
       )}
+      {mounted.has('/intel') && (
+        <PageSlot active={active === '/intel'}>
+          <IntelPage />
+        </PageSlot>
+      )}
       {mounted.has('/settings') && (
         <PageSlot active={active === '/settings'}>
           <SettingsPage />
         </PageSlot>
       )}
+      <IntelAiDialog />
     </div>
   )
 }

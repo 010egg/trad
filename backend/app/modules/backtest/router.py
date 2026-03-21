@@ -3,12 +3,12 @@ import json
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select, desc, func, text
+from sqlalchemy import select, desc, text
 
 from app.deps import DB
 from app.modules.auth.models import User
 from app.modules.auth.router import get_current_user
-from app.modules.backtest.models import BacktestRecord, HistoricalKline
+from app.modules.backtest.models import BacktestRecord
 from app.modules.backtest.schemas import (
     BacktestRequest,
     BatchBacktestRequest,
@@ -17,6 +17,7 @@ from app.modules.backtest.schemas import (
     BacktestRecordResponse,
     BacktestRecordDetail,
     BacktestRecordUpdate,
+    BacktestRecordTagsUpdate,
 )
 from app.modules.backtest.engine import fetch_historical_klines, run_backtest
 
@@ -27,8 +28,29 @@ def _wrap(data):
     return {"code": 0, "data": data, "message": "ok"}
 
 
+def _coalesce_metric(value, default=0):
+    return value if value is not None else default
+
+
 def _auto_name(req: BacktestRequest) -> str:
     """自动生成策略名称"""
+    if req.strategy_mode == "dca":
+        return f"DCA({req.dca_interval_bars}bars/${req.dca_amount}) {req.symbol} {req.start_date}~{req.end_date}"
+    if req.strategy_mode == "martingale":
+        prefix = f"Martingale(x{req.martingale_multiplier}/max{req.martingale_max_rounds})"
+        parts = []
+        flat = [c for group in req.entry_conditions for c in group]
+        for c in flat:
+            t = c.type.upper()
+            if t in ("MA", "EMA"):
+                parts.append(f"{t}{c.fast or 20}x{c.slow or 60}")
+            elif t == "RSI":
+                parts.append(f"RSI{c.period or 14}")
+            elif t == "MACD":
+                parts.append("MACD")
+        indicator = "+".join(parts) if parts else "Signal"
+        return f"{prefix} {indicator} {req.symbol} {req.start_date}~{req.end_date}"
+
     parts = []
     # entry_conditions is now list[list[ConditionItem]]; flatten for naming
     flat = [c for group in req.entry_conditions for c in group]
@@ -90,6 +112,12 @@ async def run(req: BacktestRequest, db: DB, user: User = Depends(get_current_use
         include_trades=req.include_trades,
         fast_period=fast_period,
         slow_period=slow_period,
+        dca_interval_bars=req.dca_interval_bars,
+        dca_amount=req.dca_amount,
+        dca_take_profit_pct=req.dca_take_profit_pct,
+        martingale_multiplier=req.martingale_multiplier,
+        martingale_max_rounds=req.martingale_max_rounds,
+        martingale_reset_on_win=req.martingale_reset_on_win,
     )
 
     # 保存记录到数据库
@@ -105,6 +133,7 @@ async def run(req: BacktestRequest, db: DB, user: User = Depends(get_current_use
         stop_loss_pct=req.stop_loss_pct,
         take_profit_pct=req.take_profit_pct,
         risk_per_trade=req.risk_per_trade,
+        strategy_mode=req.strategy_mode,
         entry_conditions=json.dumps(entry_conds),
         exit_conditions=json.dumps(exit_conds),
         total_return=result["total_return_pct"],
@@ -113,6 +142,11 @@ async def run(req: BacktestRequest, db: DB, user: User = Depends(get_current_use
         profit_factor=result["profit_factor"],
         max_drawdown=result["max_drawdown"],
         sharpe_ratio=result["sharpe_ratio"],
+        calmar_ratio=result.get("calmar_ratio", 0),
+        max_consecutive_losses=result.get("max_consecutive_losses", 0),
+        max_dd_duration_hours=result.get("max_dd_duration_hours", 0),
+        sortino_ratio=result.get("sortino_ratio", 0),
+        tail_ratio=result.get("tail_ratio", 0),
         total_trades=result["total_trades"],
         avg_holding_hours=result["avg_holding_hours"],
         trades=json.dumps(result["trades"]),
@@ -135,12 +169,21 @@ async def list_records(db: DB, user: User = Depends(get_current_user)):
             initial_balance=r.initial_balance,
             stop_loss_pct=r.stop_loss_pct, take_profit_pct=r.take_profit_pct,
             risk_per_trade=r.risk_per_trade,
+            position_pct=round(r.risk_per_trade / r.stop_loss_pct * 100, 2) if r.stop_loss_pct and r.stop_loss_pct > 0 else 0.0,
+            strategy_mode=r.strategy_mode,
             total_return_pct=r.total_return, final_balance=r.final_balance,
             win_rate=r.win_rate, profit_factor=r.profit_factor,
             max_drawdown=r.max_drawdown, sharpe_ratio=r.sharpe_ratio,
+            calmar_ratio=_coalesce_metric(getattr(r, 'calmar_ratio', 0)),
+            max_consecutive_losses=_coalesce_metric(getattr(r, 'max_consecutive_losses', 0)),
+            max_dd_duration_hours=_coalesce_metric(getattr(r, 'max_dd_duration_hours', 0)),
+            sortino_ratio=_coalesce_metric(getattr(r, 'sortino_ratio', 0)),
+            tail_ratio=_coalesce_metric(getattr(r, 'tail_ratio', 0)),
             total_trades=r.total_trades, avg_holding_hours=r.avg_holding_hours,
+            is_favorite=r.is_favorite,
+            tags=json.loads(r.tags) if r.tags else [],
             created_at=r.created_at.isoformat(),
-        ).model_dump()
+        ).model_dump(exclude_none=False)
         for r in rows
     ]
     return _wrap(data)
@@ -158,14 +201,23 @@ async def get_record(record_id: str, db: DB, user: User = Depends(get_current_us
         initial_balance=record.initial_balance,
         stop_loss_pct=record.stop_loss_pct, take_profit_pct=record.take_profit_pct,
         risk_per_trade=record.risk_per_trade,
+        position_pct=round(record.risk_per_trade / record.stop_loss_pct * 100, 2) if record.stop_loss_pct and record.stop_loss_pct > 0 else 0.0,
+        strategy_mode=record.strategy_mode,
         total_return_pct=record.total_return, final_balance=record.final_balance,
         win_rate=record.win_rate, profit_factor=record.profit_factor,
         max_drawdown=record.max_drawdown, sharpe_ratio=record.sharpe_ratio,
+        calmar_ratio=getattr(record, 'calmar_ratio', 0) or 0,
+        max_consecutive_losses=getattr(record, 'max_consecutive_losses', 0) or 0,
+        max_dd_duration_hours=getattr(record, 'max_dd_duration_hours', 0) or 0,
+        sortino_ratio=getattr(record, 'sortino_ratio', 0) or 0,
+        tail_ratio=getattr(record, 'tail_ratio', 0) or 0,
         total_trades=record.total_trades, avg_holding_hours=record.avg_holding_hours,
+        is_favorite=record.is_favorite,
+        tags=json.loads(record.tags) if record.tags else [],
         entry_conditions=record.entry_conditions, exit_conditions=record.exit_conditions,
         trades=record.trades,
         created_at=record.created_at.isoformat(),
-    ).model_dump()
+    ).model_dump(exclude_none=False)
     return _wrap(data)
 
 
@@ -178,6 +230,28 @@ async def update_record(record_id: str, body: BacktestRecordUpdate, db: DB, user
     record.name = body.name
     await db.commit()
     return _wrap({"id": record.id, "name": record.name})
+
+
+@router.patch("/records/{record_id}/favorite")
+async def toggle_favorite(record_id: str, db: DB, user: User = Depends(get_current_user)):
+    stmt = select(BacktestRecord).where(BacktestRecord.id == record_id, BacktestRecord.user_id == user.id)
+    record = (await db.execute(stmt)).scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    record.is_favorite = not record.is_favorite
+    await db.commit()
+    return _wrap({"id": record.id, "is_favorite": record.is_favorite})
+
+
+@router.patch("/records/{record_id}/tags")
+async def update_tags(record_id: str, body: BacktestRecordTagsUpdate, db: DB, user: User = Depends(get_current_user)):
+    stmt = select(BacktestRecord).where(BacktestRecord.id == record_id, BacktestRecord.user_id == user.id)
+    record = (await db.execute(stmt)).scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    record.tags = json.dumps(body.tags)
+    await db.commit()
+    return _wrap({"id": record.id, "tags": body.tags})
 
 
 @router.delete("/records/{record_id}")
@@ -329,6 +403,12 @@ def _build_run_kwargs(req: BacktestRequest, entry_conds, exit_conds,
         include_trades=req.include_trades,
         fast_period=fast_period,
         slow_period=slow_period,
+        dca_interval_bars=req.dca_interval_bars,
+        dca_amount=req.dca_amount,
+        dca_take_profit_pct=req.dca_take_profit_pct,
+        martingale_multiplier=req.martingale_multiplier,
+        martingale_max_rounds=req.martingale_max_rounds,
+        martingale_reset_on_win=req.martingale_reset_on_win,
     )
 
 
@@ -392,7 +472,7 @@ async def batch_run(body: BatchBacktestRequest, db: DB, user: User = Depends(get
 
 # ============ 网格搜索 ============
 
-_VALID_SORT_KEYS = {"sharpe_ratio", "total_return_pct", "calmar_ratio", "max_drawdown", "profit_factor"}
+_VALID_SORT_KEYS = {"sharpe_ratio", "total_return_pct", "calmar_ratio", "max_drawdown", "profit_factor", "sortino_ratio"}
 _SORT_ASCENDING = {"max_drawdown"}  # 这些指标越小越好
 
 

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router'
 import { useAuthStore } from '@/stores/useAuthStore'
+import { BrandMark, BrandWordmark } from '@/components/BrandMark'
 
 export function RegisterPage() {
   const [username, setUsername] = useState('')
@@ -28,9 +29,11 @@ export function RegisterPage() {
     <div className="min-h-screen flex items-center justify-center">
       <div className="w-[400px] bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-lg p-8">
         <div className="text-center mb-8">
-          <div className="w-12 h-12 bg-[var(--color-accent)] rounded-lg flex items-center justify-center text-2xl text-white font-bold mx-auto mb-4">T</div>
-          <h1 className="text-2xl font-semibold mb-1">创建账号</h1>
-          <p className="text-sm text-[var(--color-text-secondary)]">开始使用 TradeGuard</p>
+          <BrandMark className="w-16 h-16 mx-auto mb-4" />
+          <div className="mb-1 flex justify-center">
+            <BrandWordmark className="text-[24px]" />
+          </div>
+          <p className="text-sm text-[var(--color-text-secondary)]">创建你的深海交易终端账户</p>
         </div>
         <form onSubmit={handleSubmit}>
           <div className="mb-4">

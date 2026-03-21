@@ -555,13 +555,21 @@ def run_backtest(
     initial_balance: float = 10000.0,
     risk_per_trade: float = 2.0,
     leverage: int = 1,
-    strategy_mode: str = "long_only",  # long_only, short_only, bidirectional
+    strategy_mode: str = "long_only",  # long_only, short_only, bidirectional, dca, martingale
     long_entry_conditions: list[list[dict]] | None = None,
     short_entry_conditions: list[list[dict]] | None = None,
     include_trades: bool = True,
     # 兼容旧接口
     fast_period: int | None = None,
     slow_period: int | None = None,
+    # DCA 参数
+    dca_interval_bars: int = 24,
+    dca_amount: float = 100.0,
+    dca_take_profit_pct: float | None = None,
+    # 马丁格尔参数
+    martingale_multiplier: float = 2.0,
+    martingale_max_rounds: int = 4,
+    martingale_reset_on_win: bool = True,
 ) -> dict:
     """
     执行回测，支持多指标组合条件、杠杆和双向交易
@@ -606,7 +614,19 @@ def run_backtest(
     # 添加收盘价到指标数据（用于布林带判断）
     indicator_data["closes"] = closes
 
-    if strategy_mode == "bidirectional":
+    if strategy_mode == "dca":
+        return _run_dca_backtest(
+            klines, initial_balance, dca_interval_bars, dca_amount,
+            dca_take_profit_pct, include_trades=include_trades,
+        )
+    elif strategy_mode == "martingale":
+        return _run_martingale_backtest(
+            klines, indicator_data, entry_conditions, exit_conditions,
+            stop_loss_pct, take_profit_pct, initial_balance, risk_per_trade, leverage,
+            martingale_multiplier, martingale_max_rounds, martingale_reset_on_win,
+            include_trades=include_trades,
+        )
+    elif strategy_mode == "bidirectional":
         return _run_bidirectional_backtest(
             klines, indicator_data, long_entry_conditions, short_entry_conditions,
             stop_loss_pct, take_profit_pct, initial_balance, risk_per_trade, leverage,
@@ -627,6 +647,7 @@ def _calculate_margin_base(
     stop_loss_pct: float,
     risk_per_trade: float,
     scale: float = 1.0,
+    leverage: int = 1,
 ) -> float:
     """
     Calculate the 1x position value implied by the stop distance.
@@ -634,6 +655,9 @@ def _calculate_margin_base(
     Leveraged PnL is applied against this base value later so that total_return
     changes with leverage, while stop_loss_pct / take_profit_pct still express
     underlying price move thresholds.
+
+    The resulting margin is capped at balance * leverage to prevent the position
+    from exceeding what is physically achievable with the given leverage.
     """
     if entry_price <= 0 or stop_loss_pct <= 0 or risk_per_trade <= 0 or scale <= 0:
         return 0.0
@@ -641,7 +665,10 @@ def _calculate_margin_base(
     sl_distance = entry_price * (stop_loss_pct / 100)
     max_loss = balance * (risk_per_trade / 100)
     position_qty = max_loss / sl_distance if sl_distance > 0 else 0.0
-    return position_qty * entry_price * scale
+    margin = position_qty * entry_price * scale
+    # Cap: collateral cannot exceed the account balance (leverage amplifies returns, not investable capital)
+    max_margin = balance * scale
+    return min(margin, max_margin)
 
 
 def _run_unidirectional_backtest(
@@ -670,6 +697,7 @@ def _run_unidirectional_backtest(
                     entry_price=entry_price,
                     stop_loss_pct=stop_loss_pct,
                     risk_per_trade=risk_per_trade,
+                    leverage=leverage,
                 )
                 if margin <= 0:
                     continue
@@ -778,6 +806,7 @@ def _run_bidirectional_backtest(
                     stop_loss_pct=stop_loss_pct,
                     risk_per_trade=risk_per_trade,
                     scale=0.5,
+                    leverage=leverage,
                 )
                 if margin <= 0:
                     continue
@@ -795,6 +824,7 @@ def _run_bidirectional_backtest(
                     stop_loss_pct=stop_loss_pct,
                     risk_per_trade=risk_per_trade,
                     scale=0.5,
+                    leverage=leverage,
                 )
                 if margin <= 0:
                     continue
@@ -952,6 +982,300 @@ def _check_boll_signal(indicator_data, current_price, i):
     return None
 
 
+def _run_dca_backtest(
+    klines, initial_balance, interval_bars, amount_per_buy,
+    take_profit_pct=None, include_trades=True,
+):
+    """
+    定投（DCA）回测：每隔 interval_bars 根K线买入固定金额，
+    最后全部卖出（或累计盈利达到 take_profit_pct 时卖出）。
+
+    收益率基于实际投入金额计算，trades 记录每笔买入的成本与最终卖出价。
+    """
+    if not klines or len(klines) < 2:
+        return _empty_result(initial_balance)
+
+    balance = initial_balance
+    total_qty = 0.0
+    total_cost = 0.0
+    # 记录每笔买入的详情（价格、数量、时间）
+    buy_log: list[dict] = []
+    peak_balance = initial_balance
+    max_drawdown = 0.0
+    buy_count = 0
+    first_buy_time = ""
+    sell_rounds: list[dict] = []  # 每轮卖出的汇总
+
+    def _sell_all(sell_price: float, sell_time: str):
+        """内部：清仓并记录每笔买入对应的盈亏"""
+        nonlocal balance, total_qty, total_cost, first_buy_time
+        trades_in_round: list[dict] = []
+        for buy in buy_log:
+            pnl = buy["qty"] * (sell_price - buy["price"])
+            pnl_pct = ((sell_price - buy["price"]) / buy["price"]) * 100
+            entry_dt = datetime.strptime(buy["time"], "%Y-%m-%d %H:%M")
+            exit_dt = datetime.strptime(sell_time, "%Y-%m-%d %H:%M")
+            duration_hours = (exit_dt - entry_dt).total_seconds() / 3600
+            trades_in_round.append({
+                "entry_time": buy["time"], "exit_time": sell_time,
+                "side": "DCA", "entry_price": round(buy["price"], 2),
+                "exit_price": round(sell_price, 2),
+                "pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 2),
+                "duration": f"{duration_hours:.1f}h",
+            })
+        sell_value = total_qty * sell_price
+        round_pnl = sell_value - total_cost
+        round_pnl_pct = ((sell_value - total_cost) / total_cost) * 100 if total_cost > 0 else 0
+        balance += sell_value
+        sell_rounds.append({
+            "pnl": round_pnl, "pnl_pct": round_pnl_pct,
+            "cost": total_cost, "value": sell_value,
+            "buys": len(buy_log),
+        })
+        total_qty = 0.0
+        total_cost = 0.0
+        first_buy_time = ""
+        buy_log.clear()
+        return trades_in_round
+
+    all_trades: list[dict] = []
+
+    for i in range(len(klines)):
+        current_price = klines[i]["close"]
+        current_time = datetime.fromtimestamp(klines[i]["time"] / 1000).strftime("%Y-%m-%d %H:%M")
+
+        # 按间隔买入
+        if i % interval_bars == 0 and balance >= amount_per_buy:
+            qty = amount_per_buy / current_price
+            total_qty += qty
+            total_cost += amount_per_buy
+            balance -= amount_per_buy
+            buy_count += 1
+            buy_log.append({"price": current_price, "qty": qty, "time": current_time})
+            if not first_buy_time:
+                first_buy_time = current_time
+
+        # 检查止盈卖出
+        if total_qty > 0 and take_profit_pct is not None:
+            current_value = total_qty * current_price
+            unrealized_pnl_pct = ((current_value - total_cost) / total_cost) * 100
+            if unrealized_pnl_pct >= take_profit_pct:
+                round_trades = _sell_all(current_price, current_time)
+                all_trades.extend(round_trades)
+
+        # 更新最大回撤（基于 balance + 持仓市值）
+        portfolio_value = balance + total_qty * current_price
+        if portfolio_value > peak_balance:
+            peak_balance = portfolio_value
+        dd = ((peak_balance - portfolio_value) / peak_balance) * 100 if peak_balance > 0 else 0
+        if dd > max_drawdown:
+            max_drawdown = dd
+
+    # 回测结束，如果还有持仓，按最后价格卖出
+    if total_qty > 0:
+        final_price = klines[-1]["close"]
+        final_time = datetime.fromtimestamp(klines[-1]["time"] / 1000).strftime("%Y-%m-%d %H:%M")
+        round_trades = _sell_all(final_price, final_time)
+        all_trades.extend(round_trades)
+
+    # 统计：基于实际投入金额计算
+    total_invested = sum(r["cost"] for r in sell_rounds) if sell_rounds else 0
+    total_sell_value = sum(r["value"] for r in sell_rounds) if sell_rounds else 0
+    total_pnl = total_sell_value - total_invested
+    # 投入回报率
+    invested_return_pct = round((total_pnl / total_invested) * 100, 2) if total_invested > 0 else 0.0
+    # 账户总回报率
+    total_return_pct = round(((balance - initial_balance) / initial_balance) * 100, 2)
+    max_drawdown_r = round(max_drawdown, 2)
+    calmar = round(invested_return_pct / max_drawdown_r, 2) if max_drawdown_r > 0 else 0.0
+
+    # 统计胜率和盈亏比（每笔买入视为独立交易）
+    wins = [t for t in all_trades if t["pnl"] > 0]
+    losses = [t for t in all_trades if t["pnl"] <= 0]
+    total_profit = sum(t["pnl"] for t in wins)
+    total_loss = abs(sum(t["pnl"] for t in losses))
+    win_rate = round(len(wins) / len(all_trades) * 100, 1) if all_trades else 0.0
+    profit_factor = round(total_profit / total_loss, 2) if total_loss > 0 else 0.0
+
+    # 平均持仓时长
+    avg_hours = 0.0
+    if all_trades:
+        avg_hours = round(sum(float(t["duration"].rstrip("h")) for t in all_trades) / len(all_trades), 1)
+
+    # sharpe: 基于每笔定投的回报率
+    returns = [t["pnl_pct"] for t in all_trades]
+    if len(returns) > 1:
+        avg_r = sum(returns) / len(returns)
+        std_r = math.sqrt(sum((r - avg_r) ** 2 for r in returns) / len(returns))
+        sharpe = round(avg_r / std_r, 2) if std_r > 0 else 0.0
+    else:
+        avg_r = returns[0] if returns else 0
+        sharpe = 0.0
+
+    # --- 新增指标 ---
+
+    # Max Consecutive Losses
+    max_consec_losses = 0
+    current_streak = 0
+    for t in all_trades:
+        if t["pnl"] <= 0:
+            current_streak += 1
+            if current_streak > max_consec_losses:
+                max_consec_losses = current_streak
+        else:
+            current_streak = 0
+
+    # Max Drawdown Duration（DCA 基于 portfolio value，用 sell_rounds 重放）
+    max_dd_duration_hours = 0.0
+    if all_trades:
+        replay_bal = initial_balance
+        replay_peak = initial_balance
+        dd_start_time = None
+        for t in all_trades:
+            replay_bal += t["pnl"]
+            if replay_bal >= replay_peak:
+                replay_peak = replay_bal
+                if dd_start_time is not None:
+                    recovery_time = datetime.strptime(t["exit_time"], "%Y-%m-%d %H:%M")
+                    dd_hours = (recovery_time - dd_start_time).total_seconds() / 3600
+                    if dd_hours > max_dd_duration_hours:
+                        max_dd_duration_hours = dd_hours
+                    dd_start_time = None
+            else:
+                if dd_start_time is None:
+                    dd_start_time = datetime.strptime(t["exit_time"], "%Y-%m-%d %H:%M")
+        if dd_start_time is not None and all_trades:
+            last_time = datetime.strptime(all_trades[-1]["exit_time"], "%Y-%m-%d %H:%M")
+            dd_hours = (last_time - dd_start_time).total_seconds() / 3600
+            if dd_hours > max_dd_duration_hours:
+                max_dd_duration_hours = dd_hours
+
+    # Sortino Ratio
+    downside_returns = [r for r in returns if r < 0]
+    downside_dev = math.sqrt(sum(r ** 2 for r in downside_returns) / len(returns)) if downside_returns else 0
+    sortino = round(avg_r / downside_dev, 2) if downside_dev > 0 else 0.0
+
+    # Tail Ratio
+    if len(returns) >= 2:
+        sorted_returns = sorted(returns)
+        n = len(sorted_returns)
+        p5 = sorted_returns[max(int(n * 0.05) - 1, 0)]
+        p95 = sorted_returns[min(int(n * 0.95), n - 1)]
+        tail_ratio = round(abs(p95) / abs(p5), 2) if abs(p5) > 0.001 else 0
+    else:
+        tail_ratio = 0
+
+    return {
+        "total_return_pct": invested_return_pct,  # 基于投入金额的回报率
+        "final_balance": round(balance, 2),
+        "win_rate": win_rate,
+        "profit_factor": profit_factor,
+        "max_drawdown": max_drawdown_r,
+        "sharpe_ratio": sharpe,
+        "calmar_ratio": calmar,
+        "max_consecutive_losses": max_consec_losses,
+        "max_dd_duration_hours": round(max_dd_duration_hours, 1),
+        "sortino_ratio": sortino,
+        "tail_ratio": tail_ratio,
+        "total_trades": buy_count,
+        "avg_holding_hours": avg_hours,
+        "trades": all_trades if include_trades else [],
+    }
+
+
+def _run_martingale_backtest(
+    klines, indicator_data, entry_conditions, exit_conditions,
+    stop_loss_pct, take_profit_pct, initial_balance, base_risk_per_trade, leverage,
+    multiplier, max_rounds, reset_on_win,
+    include_trades=True,
+):
+    """
+    马丁格尔回测：亏损后按倍数加大仓位，盈利后重置。
+    基于信号交易，仅改变仓位大小的动态管理。
+    """
+    trades = []
+    balance = initial_balance
+    peak_balance = initial_balance
+    max_drawdown = 0.0
+    in_position = False
+    entry_price = 0.0
+    entry_time = ""
+    margin = 0.0
+
+    current_risk = base_risk_per_trade
+    consecutive_losses = 0
+
+    for i in range(1, len(klines)):
+        if not in_position:
+            all_met = _evaluate_condition_groups(entry_conditions, indicator_data, i)
+            if all_met:
+                entry_price = klines[i]["close"]
+                entry_time = datetime.fromtimestamp(klines[i]["time"] / 1000).strftime("%Y-%m-%d %H:%M")
+                margin = _calculate_margin_base(
+                    balance=balance,
+                    entry_price=entry_price,
+                    stop_loss_pct=stop_loss_pct,
+                    risk_per_trade=current_risk,
+                    leverage=leverage,
+                )
+                if margin <= 0:
+                    continue
+                in_position = True
+                continue
+
+        if in_position:
+            current_price = klines[i]["close"]
+            pnl_pct = ((current_price - entry_price) / entry_price) * 100 * leverage
+
+            should_exit = False
+            if pnl_pct <= -100:
+                should_exit = True
+                pnl_pct = -100
+            elif pnl_pct <= -stop_loss_pct * leverage:
+                should_exit = True
+            elif pnl_pct >= take_profit_pct * leverage:
+                should_exit = True
+            elif _evaluate_condition_groups(exit_conditions, indicator_data, i):
+                should_exit = True
+
+            if should_exit:
+                pnl = margin * (pnl_pct / 100)
+                balance += pnl
+                exit_time = datetime.fromtimestamp(klines[i]["time"] / 1000).strftime("%Y-%m-%d %H:%M")
+                entry_dt = datetime.strptime(entry_time, "%Y-%m-%d %H:%M")
+                exit_dt = datetime.strptime(exit_time, "%Y-%m-%d %H:%M")
+                duration_hours = (exit_dt - entry_dt).total_seconds() / 3600
+
+                trades.append({
+                    "entry_time": entry_time, "exit_time": exit_time, "side": "LONG",
+                    "entry_price": round(entry_price, 2), "exit_price": round(current_price, 2),
+                    "pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 2),
+                    "duration": f"{duration_hours:.1f}h",
+                })
+
+                # 马丁格尔逻辑：调整下一笔的仓位
+                if pnl > 0:
+                    # 盈利：重置仓位
+                    if reset_on_win:
+                        current_risk = base_risk_per_trade
+                        consecutive_losses = 0
+                else:
+                    # 亏损：加大仓位
+                    consecutive_losses += 1
+                    if consecutive_losses <= max_rounds:
+                        current_risk = base_risk_per_trade * (multiplier ** consecutive_losses)
+                    # 超过最大轮次不再加倍
+
+                if balance > peak_balance:
+                    peak_balance = balance
+                dd = ((peak_balance - balance) / peak_balance) * 100
+                if dd > max_drawdown:
+                    max_drawdown = dd
+                in_position = False
+
+    return _calc_stats(trades, balance, initial_balance, max_drawdown, include_trades)
+
+
 def _precompute_indicators(closes, highs, lows, conditions):
     """根据条件列表预计算所有需要的指标"""
     data: dict[str, list] = {"closes": closes}
@@ -1008,6 +1332,8 @@ def _empty_result(initial_balance: float = 10000.0):
         "total_return_pct": 0.0, "final_balance": initial_balance,
         "win_rate": 0, "profit_factor": 0,
         "max_drawdown": 0, "sharpe_ratio": 0, "calmar_ratio": 0,
+        "max_consecutive_losses": 0, "max_dd_duration_hours": 0,
+        "sortino_ratio": 0, "tail_ratio": 0,
         "total_trades": 0, "avg_holding_hours": 0, "trades": [],
     }
 
@@ -1029,6 +1355,56 @@ def _calc_stats(trades, balance, initial_balance, max_drawdown, include_trades: 
     max_drawdown_r = round(max_drawdown, 2)
     calmar = round(total_return_pct / max_drawdown_r, 2) if max_drawdown_r > 0 else 0.0
 
+    # --- 新增指标 ---
+
+    # Max Consecutive Losses
+    max_consec_losses = 0
+    current_streak = 0
+    for t in trades:
+        if t["pnl"] <= 0:
+            current_streak += 1
+            if current_streak > max_consec_losses:
+                max_consec_losses = current_streak
+        else:
+            current_streak = 0
+
+    # Max Drawdown Duration（从 trades 重放 equity curve）
+    max_dd_duration_hours = 0.0
+    replay_balance = initial_balance
+    replay_peak = initial_balance
+    dd_start_time = None
+    for t in trades:
+        replay_balance += t["pnl"]
+        if replay_balance >= replay_peak:
+            replay_peak = replay_balance
+            if dd_start_time is not None:
+                recovery_time = datetime.strptime(t["exit_time"], "%Y-%m-%d %H:%M")
+                dd_hours = (recovery_time - dd_start_time).total_seconds() / 3600
+                if dd_hours > max_dd_duration_hours:
+                    max_dd_duration_hours = dd_hours
+                dd_start_time = None
+        else:
+            if dd_start_time is None:
+                dd_start_time = datetime.strptime(t["exit_time"], "%Y-%m-%d %H:%M")
+    # 如果回测结束仍在回撤中，计算到最后一笔交易的时间
+    if dd_start_time is not None and trades:
+        last_time = datetime.strptime(trades[-1]["exit_time"], "%Y-%m-%d %H:%M")
+        dd_hours = (last_time - dd_start_time).total_seconds() / 3600
+        if dd_hours > max_dd_duration_hours:
+            max_dd_duration_hours = dd_hours
+
+    # Sortino Ratio（只惩罚下行波动）
+    downside_returns = [r for r in returns if r < 0]
+    downside_dev = math.sqrt(sum(r ** 2 for r in downside_returns) / len(returns)) if downside_returns else 0
+    sortino = round(avg_return / downside_dev, 2) if downside_dev > 0 else 0
+
+    # Tail Ratio（P95 / P5，衡量收益分布偏度）
+    sorted_returns = sorted(returns)
+    n = len(sorted_returns)
+    p5 = sorted_returns[max(int(n * 0.05) - 1, 0)]
+    p95 = sorted_returns[min(int(n * 0.95), n - 1)]
+    tail_ratio = round(abs(p95) / abs(p5), 2) if abs(p5) > 0.001 else 0
+
     return {
         "total_return_pct": total_return_pct,
         "final_balance": round(balance, 2),
@@ -1037,6 +1413,10 @@ def _calc_stats(trades, balance, initial_balance, max_drawdown, include_trades: 
         "max_drawdown": max_drawdown_r,
         "sharpe_ratio": round(avg_return / std_return, 2) if std_return > 0 else 0,
         "calmar_ratio": calmar,
+        "max_consecutive_losses": max_consec_losses,
+        "max_dd_duration_hours": round(max_dd_duration_hours, 1),
+        "sortino_ratio": sortino,
+        "tail_ratio": tail_ratio,
         "total_trades": len(trades),
         "avg_holding_hours": round(sum(float(t["duration"].rstrip("h")) for t in trades) / len(trades), 1),
         "trades": trades if include_trades else [],

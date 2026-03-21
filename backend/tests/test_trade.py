@@ -163,6 +163,204 @@ async def test_list_live_spot_positions_returns_entry_price(client, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_trade_settings_default_system_prompt_is_prepopulated(client):
+    token = await _get_token(client)
+
+    response = await client.get(
+        "/api/v1/trade/settings",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    settings = response.json()["data"]
+    assert settings["llm_system_prompt"]
+    assert "crypto market intelligence copilot" in settings["llm_system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_trade_settings_support_llm_config(client):
+    token = await _get_token(client)
+
+    update_response = await client.put(
+        "/api/v1/trade/settings",
+        json={
+            "llm_enabled": True,
+            "llm_provider": "ANTHROPIC",
+            "llm_base_url": "https://api.minimax.io",
+            "llm_model": "MiniMax-M1",
+            "llm_system_prompt": "全部使用中文，优先提示风险。",
+            "llm_api_key": "sk-test-12345678",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert update_response.status_code == 200
+    settings = update_response.json()["data"]
+    assert settings["llm_enabled"] is True
+    assert settings["llm_provider"] == "ANTHROPIC"
+    assert settings["llm_base_url"] == "https://api.minimax.io/anthropic"
+    assert settings["llm_model"] == "MiniMax-M1"
+    assert settings["llm_system_prompt"] == "全部使用中文，优先提示风险。"
+    assert settings["llm_has_api_key"] is True
+    assert settings["llm_api_key_masked"] is not None
+
+    get_response = await client.get(
+        "/api/v1/trade/settings",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert get_response.status_code == 200
+    settings = get_response.json()["data"]
+    assert settings["llm_enabled"] is True
+    assert settings["llm_provider"] == "ANTHROPIC"
+    assert settings["llm_system_prompt"] == "全部使用中文，优先提示风险。"
+    assert settings["llm_has_api_key"] is True
+    assert settings["llm_api_key_masked"].startswith("sk-t")
+
+    clear_response = await client.put(
+        "/api/v1/trade/settings",
+        json={"llm_api_key": "", "llm_enabled": False},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert clear_response.status_code == 200
+    settings = clear_response.json()["data"]
+    assert settings["llm_enabled"] is False
+    assert settings["llm_has_api_key"] is False
+    assert settings["llm_api_key_masked"] is None
+
+
+@pytest.mark.asyncio
+async def test_trade_settings_support_cn_llm_base_url_normalization(client):
+    token = await _get_token(client)
+
+    update_response = await client.put(
+        "/api/v1/trade/settings",
+        json={
+            "llm_enabled": True,
+            "llm_provider": "OPENAI",
+            "llm_base_url": "https://api.minimaxi.com",
+            "llm_model": "MiniMax-M2.7",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert update_response.status_code == 200
+    settings = update_response.json()["data"]
+    assert settings["llm_provider"] == "OPENAI"
+    assert settings["llm_base_url"] == "https://api.minimaxi.com/v1"
+
+
+@pytest.mark.asyncio
+async def test_trade_settings_support_cn_anthropic_v1_base_url_normalization(client):
+    token = await _get_token(client)
+
+    update_response = await client.put(
+        "/api/v1/trade/settings",
+        json={
+            "llm_enabled": True,
+            "llm_provider": "ANTHROPIC",
+            "llm_base_url": "https://api.minimaxi.com/anthropic/v1",
+            "llm_model": "MiniMax-M2.5",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert update_response.status_code == 200
+    settings = update_response.json()["data"]
+    assert settings["llm_provider"] == "ANTHROPIC"
+    assert settings["llm_base_url"] == "https://api.minimaxi.com/anthropic"
+
+
+@pytest.mark.asyncio
+async def test_trade_settings_llm_connectivity_test_uses_saved_key(client, monkeypatch):
+    token = await _get_token(client)
+
+    await client.put(
+        "/api/v1/trade/settings",
+        json={
+            "llm_enabled": True,
+            "llm_base_url": "https://api.minimax.chat/v1",
+            "llm_model": "MiniMax-M1",
+            "llm_api_key": "sk-saved-12345678",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    async def fake_test_llm_connectivity(runtime_config):
+        assert runtime_config["base_url"] == "https://api.minimax.io/anthropic"
+        assert runtime_config["model"] == "MiniMax-M1"
+        assert runtime_config["api_key"] == "sk-saved-12345678"
+        assert runtime_config["provider"] == "ANTHROPIC"
+        return {
+            "success": True,
+            "latency_ms": 123,
+            "model": runtime_config["model"],
+            "preview": "OK",
+        }
+
+    monkeypatch.setattr(
+        "app.modules.trade.router.test_llm_connectivity",
+        fake_test_llm_connectivity,
+    )
+
+    response = await client.post(
+        "/api/v1/trade/settings/llm-test",
+        json={
+            "base_url": "https://api.minimax.io",
+            "model": "MiniMax-M1",
+            "provider": "ANTHROPIC",
+            "use_saved_api_key": True,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["success"] is True
+    assert data["latency_ms"] == 123
+    assert data["preview"] == "OK"
+
+
+@pytest.mark.asyncio
+async def test_trade_settings_llm_connectivity_rejects_non_ascii_base_url(client):
+    token = await _get_token(client)
+
+    response = await client.post(
+        "/api/v1/trade/settings/llm-test",
+        json={
+            "provider": "ANTHROPIC",
+            "base_url": "https://api.minimax.chat/v1│",
+            "model": "MiniMax-M1",
+            "api_key": "sk-test-12345678",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 400
+    assert "Base URL 包含非法字符" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_trade_settings_llm_connectivity_anthropic_404_shows_endpoint_hint(client, monkeypatch):
+    token = await _get_token(client)
+
+    async def fake_test_llm_connectivity(runtime_config):
+        assert runtime_config["provider"] == "ANTHROPIC"
+        raise RuntimeError("模型接口返回错误：HTTP 404，Anthropic 兼容协议应使用 https://api.minimaxi.com/anthropic，当前地址不是该入口")
+
+    monkeypatch.setattr(
+        "app.modules.trade.router.test_llm_connectivity",
+        fake_test_llm_connectivity,
+    )
+
+    response = await client.post(
+        "/api/v1/trade/settings/llm-test",
+        json={
+            "provider": "ANTHROPIC",
+            "base_url": "https://www.minimaxi.com",
+            "model": "MiniMax-M2.7",
+            "api_key": "sk-test-12345678",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 400
+    assert "https://api.minimaxi.com/anthropic" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_close_position(client):
     token = await _get_token(client)
     # 开仓（使用小数量和合理止损价）

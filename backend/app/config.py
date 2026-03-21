@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     binance_base_endpoint: str = ""
     binance_https_proxy: str | None = None
 
+    # AI 情报摘要
+    openai_api_key: str | None = None
+    openai_base_url: str | None = None
+    openai_model: str | None = "minimax"
+
     model_config = {"env_file": ".env"}
 
 

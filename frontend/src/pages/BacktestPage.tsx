@@ -13,7 +13,9 @@ interface Trade {
 interface Result {
   total_return_pct: number; win_rate: number; profit_factor: number;
   max_drawdown: number; sharpe_ratio: number; total_trades: number;
-  avg_holding_hours: number; trades: Trade[]; record_id?: string;
+  avg_holding_hours: number; sortino_ratio: number;
+  max_consecutive_losses: number; max_dd_duration_hours: number;
+  tail_ratio: number; trades: Trade[]; record_id?: string;
   final_balance?: number;
 }
 
@@ -105,9 +107,13 @@ function toPrettyJson(value: unknown): string {
 }
 
 function sanitizeFileName(value: string): string {
+  const invalidFileNameChars = new Set(['<', '>', ':', '"', '/', '\\', '|', '?', '*'])
+
   return value
     .trim()
-    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-')
+    .split('')
+    .filter((char) => char.charCodeAt(0) >= 32 && !invalidFileNameChars.has(char))
+    .join('')
     .replace(/\s+/g, '-')
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '')
@@ -219,6 +225,22 @@ function newCondition(type: string = 'MA'): Condition {
   return base
 }
 
+function storedCondToCondition(sc: StoredCondition): Condition {
+  const type = sc.type || 'MA'
+  const base = newCondition(type)
+  return {
+    ...base,
+    op: sc.op ?? base.op,
+    fast: sc.fast ?? base.fast,
+    slow: sc.slow ?? base.slow,
+    n: sc.n ?? base.n,
+    line: sc.line ?? base.line,
+    target_line: sc.target_line ?? base.target_line,
+    period: sc.period ?? base.period,
+    value: sc.value ?? base.value,
+  }
+}
+
 function ConditionEditor({ cond, onChange, onRemove }: { cond: Condition; onChange: (c: Condition) => void; onRemove: () => void }) {
   const handleTypeChange = (type: string) => onChange(newCondition(type))
   return (
@@ -268,17 +290,23 @@ function ConditionEditor({ cond, onChange, onRemove }: { cond: Condition; onChan
 
 const LEVERAGE_PRESETS = [1, 2, 3, 5, 10, 20, 50, 75, 100, 125]
 
-type HistorySortField = 'total_return_pct' | 'win_rate' | 'profit_factor' | 'max_drawdown' | 'sharpe_ratio' | 'total_trades' | 'avg_holding_hours' | 'created_at'
+type HistorySortField = 'total_return_pct' | 'win_rate' | 'profit_factor' | 'max_drawdown' | 'sharpe_ratio' | 'sortino_ratio' | 'max_consecutive_losses' | 'max_dd_duration_hours' | 'tail_ratio' | 'total_trades' | 'avg_holding_hours' | 'position_pct' | 'leverage' | 'created_at'
 
 const HISTORY_SORT_OPTIONS: { value: HistorySortField; label: string }[] = [
-  { value: 'total_return_pct', label: '总收益率' },
+  { value: 'total_return_pct', label: '收益率' },
   { value: 'win_rate', label: '胜率' },
   { value: 'profit_factor', label: '盈亏比' },
-  { value: 'max_drawdown', label: '最大回撤' },
-  { value: 'sharpe_ratio', label: '夏普比率' },
-  { value: 'total_trades', label: '总成交笔数' },
-  { value: 'avg_holding_hours', label: '平均持仓时长' },
-  { value: 'created_at', label: '创建时间' },
+  { value: 'max_drawdown', label: '回撤' },
+  { value: 'sharpe_ratio', label: '夏普' },
+  { value: 'sortino_ratio', label: 'Sortino' },
+  { value: 'max_consecutive_losses', label: '连亏' },
+  { value: 'max_dd_duration_hours', label: '回撤时长' },
+  { value: 'tail_ratio', label: '尾部' },
+  { value: 'total_trades', label: '交易数' },
+  { value: 'avg_holding_hours', label: '持仓' },
+  { value: 'position_pct', label: '仓位' },
+  { value: 'leverage', label: '杠杆' },
+  { value: 'created_at', label: '时间' },
 ]
 
 function getRecordSortValue(record: BacktestRecord, field: HistorySortField): number {
@@ -293,6 +321,8 @@ export function BacktestPage() {
   const deleteRecord = useBacktestStore((state) => state.deleteRecord)
   const updateRecord = useBacktestStore((state) => state.updateRecord)
   const getRecord = useBacktestStore((state) => state.getRecord)
+  const toggleFavorite = useBacktestStore((state) => state.toggleFavorite)
+  const updateTags = useBacktestStore((state) => state.updateTags)
   const setSignals = useBacktestSignalStore((state) => state.setSignals)
   const [symbol, setSymbol] = useState('BTCUSDT')
   const [interval, setInterval] = useState('15m')
@@ -300,13 +330,22 @@ export function BacktestPage() {
   const [endDate, setEndDate] = useState('2025-06-01')
   const [sl, setSl] = useState<string>('2')
   const [tp, setTp] = useState<string>('6')
+  const [positionPct, setPositionPct] = useState<string>('50')
   const [leverage, setLeverage] = useState(1)
   const [strategyName, setStrategyName] = useState('')
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState<Result | null>(null)
-  const [strategyMode, setStrategyMode] = useState<'long_only' | 'short_only' | 'bidirectional'>('long_only')
+  const [strategyMode, setStrategyMode] = useState<'long_only' | 'short_only' | 'bidirectional' | 'dca' | 'martingale'>('long_only')
+  // DCA 参数
+  const [dcaIntervalBars, setDcaIntervalBars] = useState<string>('24')
+  const [dcaAmount, setDcaAmount] = useState<string>('100')
+  const [dcaTakeProfitPct, setDcaTakeProfitPct] = useState<string>('')
+  // 马丁格尔参数
+  const [martingaleMultiplier, setMartingaleMultiplier] = useState<string>('2')
+  const [martingaleMaxRounds, setMartingaleMaxRounds] = useState<string>('4')
+  const [martingaleResetOnWin, setMartingaleResetOnWin] = useState(true)
   const [entryConditions, setEntryConditions] = useState<Condition[]>([newCondition('MA')])
-  const [exitConditions] = useState<Condition[]>([])
+  const [exitConditions, setExitConditions] = useState<Condition[]>([])
   const [longEntryConditions, setLongEntryConditions] = useState<Condition[]>([newCondition('BOLL')])
   const [shortEntryConditions, setShortEntryConditions] = useState<Condition[]>([{ ...newCondition('BOLL'), op: 'touch_upper' }])
   const [activeTab, setActiveTab] = useState<'result' | 'history'>('result')
@@ -317,6 +356,13 @@ export function BacktestPage() {
   const [historySortField, setHistorySortField] = useState<HistorySortField>('total_return_pct')
   const [historySortDirection, setHistorySortDirection] = useState<'desc' | 'asc'>('desc')
   const [availableData, setAvailableData] = useState<AvailableDataItem[]>([])
+  const [tagFilters, setTagFilters] = useState<string[]>([])
+  const [showFavoritesOnly, setShowFavoritesOnly] = useState(false)
+  const [addingTagFor, setAddingTagFor] = useState<string | null>(null)
+  const [newTagInput, setNewTagInput] = useState('')
+
+  // 收集所有已使用的 tag（去重、排序）
+  const allTags = [...new Set(records.flatMap((r) => r.tags))].sort()
 
   const handleNumberInputChange = (setter: (v: string) => void) => (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = e.target.value
@@ -353,8 +399,21 @@ export function BacktestPage() {
   const runBacktest = async () => {
     setLoading(true)
     try {
-      const payload: any = { symbol, interval, start_date: startDate, end_date: endDate, strategy_mode: strategyMode, stop_loss_pct: parseFloat(sl) || 0, take_profit_pct: parseFloat(tp) || 0, leverage, name: strategyName || undefined }
-      if (strategyMode === 'bidirectional') { payload.long_entry_conditions = longEntryConditions.map(condToApi); payload.short_entry_conditions = shortEntryConditions.map(condToApi) }
+      const slVal = parseFloat(sl) || 0
+      // 仓位占比 → risk_per_trade：引擎用 risk/sl 算仓位比例，反推即 positionPct/100 * sl
+      const riskPerTrade = (parseFloat(positionPct) || 50) * slVal / 100
+      const payload: any = { symbol, interval, start_date: startDate, end_date: endDate, strategy_mode: strategyMode, stop_loss_pct: slVal, take_profit_pct: parseFloat(tp) || 0, risk_per_trade: riskPerTrade, leverage, name: strategyName || undefined }
+      console.log('[handleRun] payload.strategy_mode:', payload.strategy_mode, '| entryConditions[0].op:', entryConditions[0]?.op)
+      if (strategyMode === 'dca') {
+        payload.dca_interval_bars = parseInt(dcaIntervalBars) || 24
+        payload.dca_amount = parseFloat(dcaAmount) || 100
+        payload.dca_take_profit_pct = dcaTakeProfitPct ? parseFloat(dcaTakeProfitPct) : null
+      } else if (strategyMode === 'martingale') {
+        payload.entry_conditions = entryConditions.map(condToApi); payload.exit_conditions = exitConditions.map(condToApi)
+        payload.martingale_multiplier = parseFloat(martingaleMultiplier) || 2
+        payload.martingale_max_rounds = parseInt(martingaleMaxRounds) || 4
+        payload.martingale_reset_on_win = martingaleResetOnWin
+      } else if (strategyMode === 'bidirectional') { payload.long_entry_conditions = longEntryConditions.map(condToApi); payload.short_entry_conditions = shortEntryConditions.map(condToApi) }
       else { payload.entry_conditions = entryConditions.map(condToApi); payload.exit_conditions = exitConditions.map(condToApi) }
       const resultData: Result = await api.post('/backtest/run', payload)
       setResult(resultData); setActiveTab('result'); setDetailResult(null); setDetailRecord(null); void fetchRecords()
@@ -363,13 +422,29 @@ export function BacktestPage() {
   }
 
   const updateEntry = (i: number, c: Condition) => setEntryConditions((prev) => prev.map((p, idx) => idx === i ? { ...c, id: p.id } : p))
+  const updateExit = (i: number, c: Condition) => setExitConditions((prev) => prev.map((p, idx) => idx === i ? { ...c, id: p.id } : p))
   const updateLongEntry = (i: number, c: Condition) => setLongEntryConditions((prev) => prev.map((p, idx) => idx === i ? { ...c, id: p.id } : p))
   const updateShortEntry = (i: number, c: Condition) => setShortEntryConditions((prev) => prev.map((p, idx) => idx === i ? { ...c, id: p.id } : p))
 
   const handleViewDetail = async (id: string) => {
     const detail = await getRecord(id)
     setDetailRecord(detail)
-    setDetailResult({ total_return_pct: detail.total_return_pct, win_rate: detail.win_rate, profit_factor: detail.profit_factor, max_drawdown: detail.max_drawdown, sharpe_ratio: detail.sharpe_ratio, total_trades: detail.total_trades, avg_holding_hours: detail.avg_holding_hours, trades: JSON.parse(detail.trades), record_id: detail.id, final_balance: detail.final_balance })
+    setDetailResult({
+      total_return_pct: detail.total_return_pct,
+      win_rate: detail.win_rate,
+      profit_factor: detail.profit_factor,
+      max_drawdown: detail.max_drawdown,
+      sharpe_ratio: detail.sharpe_ratio,
+      sortino_ratio: detail.sortino_ratio,
+      max_consecutive_losses: detail.max_consecutive_losses,
+      max_dd_duration_hours: detail.max_dd_duration_hours,
+      tail_ratio: detail.tail_ratio,
+      total_trades: detail.total_trades,
+      avg_holding_hours: detail.avg_holding_hours,
+      trades: parseJsonArray<Trade>(detail.trades),
+      record_id: detail.id,
+      final_balance: detail.final_balance,
+    })
     setActiveTab('result')
   }
 
@@ -384,6 +459,68 @@ export function BacktestPage() {
     } catch (error) { console.error('Failed to apply signals to dashboard:', error) }
   }
 
+  const handleApplyToStrategy = async (record: BacktestRecordDetail) => {
+    try {
+      const detail = detailRecord?.id === record.id ? record : await getRecord(record.id)
+      setSymbol(detail.symbol)
+      setInterval(detail.interval)
+      setStartDate(detail.start_date)
+      setEndDate(detail.end_date)
+      setSl(String(detail.stop_loss_pct))
+      setTp(String(detail.take_profit_pct))
+      setLeverage(detail.leverage)
+      setStrategyName('')
+      // 直接使用后端已计算好的 position_pct，避免 Math.round 精度丢失
+      setPositionPct(String(detail.position_pct))
+      // 恢复原始策略模式
+      let mode = (detail.strategy_mode || 'long_only') as typeof strategyMode
+      // 如果后端没有返回 strategy_mode，尝试从交易数据推断
+      if (!detail.strategy_mode) {
+        try {
+          const trades = parseJsonArray<any>(detail.trades)
+          if (trades.length > 0) {
+            const hasShort = trades.some((t: any) => t.side === 'SHORT')
+            const hasLong = trades.some((t: any) => t.side === 'LONG')
+            if (hasShort && !hasLong) {
+              mode = 'short_only'
+              console.log('[applyToStrategy] inferred mode from trades: short_only')
+            } else if (hasLong && !hasShort) {
+              mode = 'long_only'
+              console.log('[applyToStrategy] inferred mode from trades: long_only')
+            } else if (hasShort && hasLong) {
+              mode = 'bidirectional'
+              console.log('[applyToStrategy] inferred mode from trades: bidirectional')
+            }
+          }
+        } catch (e) {
+          console.error('Failed to parse trades for mode inference:', e)
+        }
+      }
+      console.log('[applyToStrategy] mode from record:', detail.strategy_mode, '→ setting state to:', mode)
+      setStrategyMode(mode)
+      const entryGroups = parseJsonArray<StoredCondition[]>(detail.entry_conditions)
+      const exitGroups = parseJsonArray<StoredCondition[]>(detail.exit_conditions)
+      const entryConds = entryGroups.flat()
+      const exitConds = exitGroups.flat()
+      if (mode === 'bidirectional') {
+        if (entryGroups.length >= 2) {
+          setLongEntryConditions(entryGroups[0].map(storedCondToCondition))
+          setShortEntryConditions(entryGroups[1].map(storedCondToCondition))
+        } else if (entryConds.length > 0) {
+          setLongEntryConditions(entryConds.map(storedCondToCondition))
+        }
+      } else {
+        if (entryConds.length > 0) setEntryConditions(entryConds.map(storedCondToCondition))
+        setExitConditions(exitConds.map(storedCondToCondition))
+      }
+      setDetailResult(null)
+      setDetailRecord(null)
+      setActiveTab('result')
+    } catch (error) {
+      console.error('Failed to apply to strategy:', error)
+    }
+  }
+
   const handleExportMarkdown = async (recordId: string) => {
     try {
       const detail = detailRecord?.id === recordId ? detailRecord : await getRecord(recordId)
@@ -394,13 +531,55 @@ export function BacktestPage() {
   }
 
   const displayResult = detailResult || result
+
+  // 实时推导每笔交易的实际影响，直接基于用户填的仓位占比
+  const slNum = parseFloat(sl) || 0
+  const tpNum = parseFloat(tp) || 0
+  const positionPctNum = parseFloat(positionPct) || 0
+  // 仓位上限是 100%（不能投入超过账户的钱），杠杆只放大收益/亏损倍率
+  const effectivePositionPct = Math.min(positionPctNum, 100)
+  const isCapped = positionPctNum > 100
+  // 触发止损/止盈时账户实际变化 = 仓位% × 价格波动% × 杠杆
+  const actualLossPct = effectivePositionPct * slNum * leverage / 100
+  const actualGainPct = effectivePositionPct * tpNum * leverage / 100
+  const initialBalance = 4000
+  const lossAmount = initialBalance * actualLossPct / 100
+  const gainAmount = initialBalance * actualGainPct / 100
+  const positionAmount = initialBalance * effectivePositionPct / 100
+  const riskInfoBlock = (
+    <div className="mt-3 space-y-1.5">
+      <div className="flex items-center justify-between text-[10px]">
+        <span className="text-[var(--color-text-disabled)]">投入仓位</span>
+        <span className="font-black font-[var(--font-mono)]">
+          {effectivePositionPct.toFixed(0)}% · {positionAmount.toFixed(0)} U{isCapped && <span className="ml-1 text-[var(--color-short)] text-[9px]">(上限100%)</span>}
+        </span>
+      </div>
+      <div className="flex items-center justify-between text-[10px]">
+        <span className="text-[var(--color-text-disabled)]">触发止损亏</span>
+        <span className="font-black font-[var(--font-mono)] text-[var(--color-short)]">-{actualLossPct.toFixed(1)}% · -{lossAmount.toFixed(0)} U</span>
+      </div>
+      <div className="flex items-center justify-between text-[10px]">
+        <span className="text-[var(--color-text-disabled)]">触发止盈赚</span>
+        <span className="font-black font-[var(--font-mono)] text-[var(--color-long)]">+{actualGainPct.toFixed(1)}% · +{gainAmount.toFixed(0)} U</span>
+      </div>
+    </div>
+  )
   const selectedDataCoverage = availableData.find((item) => item.symbol === symbol && item.interval === interval)
-  const sortedRecords = [...records].sort((a, b) => {
+  // 收藏过滤 + 标签过滤（多选 OR），最后按指标排序（收藏置顶）
+  const filteredRecords = records.filter((r) => {
+    if (showFavoritesOnly && !r.is_favorite) return false
+    if (tagFilters.length > 0 && !tagFilters.some((t) => r.tags.includes(t))) return false
+    return true
+  })
+  const sortedRecords = [...filteredRecords].sort((a, b) => {
+    // 收藏优先
+    if (a.is_favorite !== b.is_favorite) return a.is_favorite ? -1 : 1
     const aValue = getRecordSortValue(a, historySortField)
     const bValue = getRecordSortValue(b, historySortField)
     if (aValue === bValue) return (Date.parse(b.created_at) || 0) - (Date.parse(a.created_at) || 0)
     return historySortDirection === 'desc' ? bValue - aValue : aValue - bValue
   })
+  const hasActiveFilter = showFavoritesOnly || tagFilters.length > 0
 
   return (
     <MainLayout>
@@ -415,7 +594,7 @@ export function BacktestPage() {
                 <input type="text" value={strategyName} onChange={(e) => setStrategyName(e.target.value)} placeholder="留空自动生成" className="w-full text-sm font-medium" /></div>
               <div><label className="block text-[10px] font-bold text-[var(--color-text-disabled)] uppercase mb-1.5">交易模式</label>
                 <select value={strategyMode} onChange={(e) => setStrategyMode(e.target.value as any)} className="w-full font-bold">
-                  <option value="long_only">仅做多 (Long Only)</option><option value="short_only">仅做空 (Short Only)</option><option value="bidirectional">双向自动 (Bi-directional)</option>
+                  <option value="long_only">仅做多 (Long Only)</option><option value="short_only">仅做空 (Short Only)</option><option value="bidirectional">双向自动 (Bi-directional)</option><option value="dca">定投 (DCA)</option><option value="martingale">马丁格尔 (Martingale)</option>
                 </select></div>
               <div className="grid grid-cols-2 gap-3">
                 <div><label className="block text-[10px] font-bold text-[var(--color-text-disabled)] uppercase mb-1.5">交易对</label>
@@ -458,16 +637,67 @@ export function BacktestPage() {
             </div>
           </div>
           <div className="flex-1 overflow-y-auto">
-            {strategyMode !== 'bidirectional' ? (
+            {strategyMode === 'dca' ? (
+              <div className="p-4 border-b border-[var(--color-border)]">
+                <div className="text-[10px] font-bold text-[var(--color-accent)] uppercase tracking-widest mb-4 flex items-center gap-1.5"><span className="w-1.5 h-1.5 rounded-full bg-[var(--color-accent)] animate-pulse"></span>定投参数 (DCA)</div>
+                <div className="text-[10px] text-[var(--color-text-disabled)] mb-4 leading-relaxed">定期等额买入，不依赖技术指标信号。适合长期看好的标的，通过时间分散降低择时风险。</div>
+                <div className="bg-[var(--color-bg-input)]/50 border border-[var(--color-border)] rounded-lg p-3 space-y-3">
+                  <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">买入间隔</label><div className="flex items-center gap-1.5"><input type="text" inputMode="numeric" value={dcaIntervalBars} onChange={handleNumberInputChange(setDcaIntervalBars)} className="!w-14 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" /><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">根K线</span></div></div>
+                  <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">每次金额</label><div className="flex items-center gap-1.5"><input type="text" inputMode="decimal" value={dcaAmount} onChange={handleNumberInputChange(setDcaAmount)} className="!w-14 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" /><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">USDT</span></div></div>
+                  <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">止盈卖出</label><div className="flex items-center gap-1.5"><input type="text" inputMode="decimal" value={dcaTakeProfitPct} onChange={handleNumberInputChange(setDcaTakeProfitPct)} placeholder="不设" className="!w-14 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" /><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">%</span></div></div>
+                </div>
+                <div className="mt-3 text-[10px] text-[var(--color-text-disabled)] leading-relaxed">
+                  {interval && dcaIntervalBars && <>每 {parseInt(dcaIntervalBars) || 24} 根 {interval} K线买入 {dcaAmount || '100'} USDT</>}
+                </div>
+              </div>
+            ) : strategyMode === 'martingale' ? (
+              <><div className="p-4 border-b border-[var(--color-border)]">
+                  <div className="text-[10px] font-bold text-[var(--color-accent)] uppercase tracking-widest mb-4 flex items-center gap-1.5"><span className="w-1.5 h-1.5 rounded-full bg-[var(--color-short)] animate-pulse"></span>马丁格尔参数</div>
+                  <div className="text-[10px] text-[var(--color-text-disabled)] mb-4 leading-relaxed">亏损后按倍数加大仓位，盈利后重置。需要配合入场/出场信号使用。高风险策略，请谨慎设置最大轮次。</div>
+                  <div className="bg-[var(--color-bg-input)]/50 border border-[var(--color-border)] rounded-lg p-3 space-y-3">
+                    <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">加倍倍数</label><div className="flex items-center gap-1.5"><input type="text" inputMode="decimal" value={martingaleMultiplier} onChange={handleNumberInputChange(setMartingaleMultiplier)} className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" /><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">x</span></div></div>
+                    <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">最大轮次</label><div className="flex items-center gap-1.5"><input type="text" inputMode="numeric" value={martingaleMaxRounds} onChange={handleNumberInputChange(setMartingaleMaxRounds)} className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" /><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">次</span></div></div>
+                    <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">盈利后重置</label><button onClick={() => setMartingaleResetOnWin(!martingaleResetOnWin)} className={`text-[10px] px-2 py-0.5 rounded border font-bold transition-all ${martingaleResetOnWin ? 'bg-[var(--color-accent)] text-white border-[var(--color-accent)]' : 'bg-transparent text-[var(--color-text-disabled)] border-[var(--color-border)]'}`}>{martingaleResetOnWin ? '是' : '否'}</button></div>
+                  </div>
+                  <div className="mt-3 text-[10px] text-[var(--color-short)] leading-relaxed font-bold">
+                    最大仓位：{positionPct}% x {martingaleMultiplier}^{martingaleMaxRounds} = {Math.min(parseFloat(positionPct) * Math.pow(parseFloat(martingaleMultiplier) || 2, parseInt(martingaleMaxRounds) || 4), leverage * 100).toFixed(0)}% 余额
+                  </div>
+                </div>
+                <div className="p-4 border-b border-[var(--color-border)]">
+                  <div className="flex items-center justify-between mb-4"><span className="text-[10px] font-bold text-[var(--color-long)] uppercase tracking-widest">入场条件 (Entry)</span><button onClick={() => setEntryConditions((prev) => [...prev, newCondition()])} className="text-[10px] px-2 py-0.5 rounded-full border border-[var(--color-long)] text-[var(--color-long)] hover:bg-[var(--color-long)] hover:text-white transition-all font-bold">+ 添加</button></div>
+                  <div className="space-y-2">{entryConditions.map((cond, i) => <ConditionEditor key={cond.id} cond={cond} onChange={(c) => updateEntry(i, c)} onRemove={() => setEntryConditions((prev) => prev.filter((_, idx) => idx !== i))} />)}</div>
+                </div>
+                <div className="p-4 border-b border-[var(--color-border)]">
+                  <div className="flex items-center justify-between mb-4"><span className="text-[10px] font-bold text-[var(--color-short)] uppercase tracking-widest">出场条件 (Exit)</span><button onClick={() => setExitConditions((prev) => [...prev, newCondition('RSI')])} className="text-[10px] px-2 py-0.5 rounded-full border border-[var(--color-short)] text-[var(--color-short)] hover:bg-[var(--color-short)] hover:text-white transition-all font-bold">+ 添加</button></div>
+                  {exitConditions.length === 0 && <div className="text-[10px] text-[var(--color-text-disabled)] py-1">留空则仅靠止损/止盈出场</div>}
+                  <div className="space-y-2">{exitConditions.map((cond, i) => <ConditionEditor key={cond.id} cond={cond} onChange={(c) => updateExit(i, c)} onRemove={() => setExitConditions((prev) => prev.filter((_, idx) => idx !== i))} />)}</div>
+                </div>
+                <div className="p-4 border-b border-[var(--color-border)] bg-[var(--color-bg-hover)]/20">
+                  <div className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase tracking-widest mb-4">风险与止盈止损</div>
+                  <div className="bg-[var(--color-bg-input)]/50 border border-[var(--color-border)] rounded-lg p-3 space-y-3">
+                    <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">止损百分比</label><div className="flex items-center gap-1.5"><input type="text" inputMode="decimal" value={sl} onChange={handleNumberInputChange(setSl)} className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" /><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">%</span></div></div>
+                    <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">止盈百分比</label><div className="flex items-center gap-1.5"><input type="text" inputMode="decimal" value={tp} onChange={handleNumberInputChange(setTp)} className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" /><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">%</span></div></div>
+                    <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">基础仓位</label><div className="flex items-center gap-1.5"><input type="text" inputMode="decimal" value={positionPct} onChange={(e) => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) { const num = parseFloat(v); if (v === '' || num <= 100) setPositionPct(v) } }} className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" /><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">%</span></div></div>
+                    {riskInfoBlock}
+                  </div>
+                </div></>
+            ) : strategyMode !== 'bidirectional' ? (
               <><div className="p-4 border-b border-[var(--color-border)]">
                   <div className="flex items-center justify-between mb-4"><span className="text-[10px] font-bold text-[var(--color-long)] uppercase tracking-widest">入场条件 (Entry)</span><button onClick={() => setEntryConditions((prev) => [...prev, newCondition()])} className="text-[10px] px-2 py-0.5 rounded-full border border-[var(--color-long)] text-[var(--color-long)] hover:bg-[var(--color-long)] hover:text-white transition-all font-bold">+ 添加</button></div>
                   <div className="space-y-2">{entryConditions.map((cond, i) => <ConditionEditor key={cond.id} cond={cond} onChange={(c) => updateEntry(i, c)} onRemove={() => setEntryConditions((prev) => prev.filter((_, idx) => idx !== i))} />)}</div>
                 </div>
+                <div className="p-4 border-b border-[var(--color-border)]">
+                  <div className="flex items-center justify-between mb-4"><span className="text-[10px] font-bold text-[var(--color-short)] uppercase tracking-widest">出场条件 (Exit)</span><button onClick={() => setExitConditions((prev) => [...prev, newCondition('RSI')])} className="text-[10px] px-2 py-0.5 rounded-full border border-[var(--color-short)] text-[var(--color-short)] hover:bg-[var(--color-short)] hover:text-white transition-all font-bold">+ 添加</button></div>
+                  {exitConditions.length === 0 && <div className="text-[10px] text-[var(--color-text-disabled)] py-1">留空则仅靠止损/止盈出场</div>}
+                  <div className="space-y-2">{exitConditions.map((cond, i) => <ConditionEditor key={cond.id} cond={cond} onChange={(c) => updateExit(i, c)} onRemove={() => setExitConditions((prev) => prev.filter((_, idx) => idx !== i))} />)}</div>
+                </div>
                 <div className="p-4 border-b border-[var(--color-border)] bg-[var(--color-bg-hover)]/20">
-                  <div className="text-[10px] font-bold text-[var(--color-short)] uppercase tracking-widest mb-4">风险与止盈止损</div>
+                  <div className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase tracking-widest mb-4">风险与止盈止损</div>
                   <div className="bg-[var(--color-bg-input)]/50 border border-[var(--color-border)] rounded-lg p-3 space-y-3">
                     <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">止损百分比</label><div className="flex items-center gap-1.5"><input type="text" inputMode="decimal" value={sl} onChange={handleNumberInputChange(setSl)} className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" /><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">%</span></div></div>
                     <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">止盈百分比</label><div className="flex items-center gap-1.5"><input type="text" inputMode="decimal" value={tp} onChange={handleNumberInputChange(setTp)} className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" /><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">%</span></div></div>
+                    <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">每笔仓位</label><div className="flex items-center gap-1.5"><input type="text" inputMode="decimal" value={positionPct} onChange={(e) => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) { const num = parseFloat(v); if (v === '' || num <= 100) setPositionPct(v) } }} className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" /><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">%</span></div></div>
+                    {riskInfoBlock}
                   </div>
                 </div></>
             ) : (
@@ -484,11 +714,13 @@ export function BacktestPage() {
                   <div className="bg-[var(--color-bg-input)]/50 border border-[var(--color-border)] rounded-lg p-3 space-y-3">
                     <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">止损百分比</label><div className="flex items-center gap-1.5"><input type="text" inputMode="decimal" value={sl} onChange={handleNumberInputChange(setSl)} className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" /><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">%</span></div></div>
                     <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">止盈百分比</label><div className="flex items-center gap-1.5"><input type="text" inputMode="decimal" value={tp} onChange={handleNumberInputChange(setTp)} className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" /><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">%</span></div></div>
+                    <div className="flex items-center justify-between"><label className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">每笔仓位</label><div className="flex items-center gap-1.5"><input type="text" inputMode="decimal" value={positionPct} onChange={(e) => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) { const num = parseFloat(v); if (v === '' || num <= 100) setPositionPct(v) } }} className="!w-12 !px-1.5 !py-0.5 text-xs text-center font-bold font-[var(--font-mono)] bg-transparent border-b border-[var(--color-border)] rounded-none" /><span className="text-[10px] font-bold text-[var(--color-text-disabled)]">%</span></div></div>
+                    {riskInfoBlock}
                   </div>
                 </div></>
             )}
           </div>
-          <div className="p-5 mt-auto"><button onClick={runBacktest} disabled={loading || (strategyMode === 'bidirectional' ? longEntryConditions.length === 0 || shortEntryConditions.length === 0 : entryConditions.length === 0)} className="w-full py-3.5 bg-[var(--color-accent)] text-white rounded-lg font-black text-sm tracking-widest cursor-pointer hover:shadow-lg hover:shadow-[var(--color-accent)]/20 active:translate-y-[1px] transition-all disabled:opacity-30 disabled:translate-y-0 border-none">{loading ? '正在回测...' : '开始回测'}</button></div>
+          <div className="p-5 mt-auto"><button onClick={runBacktest} disabled={loading || (strategyMode === 'dca' ? false : strategyMode === 'bidirectional' ? longEntryConditions.length === 0 || shortEntryConditions.length === 0 : entryConditions.length === 0)} className="w-full py-3.5 bg-[var(--color-accent)] text-white rounded-lg font-black text-sm tracking-widest cursor-pointer hover:shadow-lg hover:shadow-[var(--color-accent)]/20 active:translate-y-[1px] transition-all disabled:opacity-30 disabled:translate-y-0 border-none">{loading ? '正在回测...' : '开始回测'}</button></div>
         </div>
 
         <div className="flex-1 overflow-y-auto flex flex-col bg-[var(--color-bg-primary)]">
@@ -505,10 +737,22 @@ export function BacktestPage() {
                     <div className="flex items-center justify-between p-4 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-xl shadow-sm">
                       <div className="flex items-center gap-3">
                         <button onClick={() => { setDetailResult(null); setDetailRecord(null); setActiveTab('history') }} className="p-1.5 rounded-full hover:bg-[var(--color-bg-input)] transition-all"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="m15 18-6-6 6-6"/></svg></button>
-                        <div><div className="text-sm font-black">{detailRecord.name}</div><div className="text-[10px] text-[var(--color-text-disabled)] font-bold uppercase">{detailRecord.symbol} · {detailRecord.interval} · {detailRecord.leverage}x</div></div>
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <button onClick={() => { void toggleFavorite(detailRecord.id); setDetailRecord((prev) => prev ? { ...prev, is_favorite: !prev.is_favorite } : prev) }} className={`text-[16px] leading-none ${detailRecord.is_favorite ? 'text-yellow-400' : 'text-[var(--color-border)]'}`}>{detailRecord.is_favorite ? '★' : '☆'}</button>
+                            <div className="text-sm font-black">{detailRecord.name}</div>
+                          </div>
+                          <div className="flex items-center gap-2 mt-1">
+                            <div className="text-[10px] text-[var(--color-text-disabled)] font-bold uppercase">{detailRecord.symbol} · {detailRecord.interval} · {detailRecord.leverage}x · <span className={detailRecord.strategy_mode === 'short_only' ? 'text-red-400' : detailRecord.strategy_mode === 'bidirectional' ? 'text-green-400' : 'text-[var(--color-text-disabled)]'}>{detailRecord.strategy_mode === 'short_only' ? '仅做空' : detailRecord.strategy_mode === 'bidirectional' ? '双向' : detailRecord.strategy_mode === 'dca' ? 'DCA' : detailRecord.strategy_mode === 'martingale' ? '马丁' : '仅做多'}</span></div>
+                            {detailRecord.tags.map((tag) => (
+                              <span key={tag} className="text-[9px] px-1.5 py-0.5 rounded-full bg-[var(--color-bg-input)] border border-[var(--color-border)] text-[var(--color-text-secondary)] font-bold">{tag}</span>
+                            ))}
+                          </div>
+                        </div>
                       </div>
                       <div className="flex items-center gap-2">
                         <button onClick={() => { void handleExportMarkdown(detailRecord.id) }} className="px-4 py-2 rounded-lg bg-[var(--color-bg-input)] text-[var(--color-text-primary)] border border-[var(--color-border)] text-[10px] font-black uppercase hover:border-[var(--color-accent)] hover:text-[var(--color-accent)] transition-all">导出 MD</button>
+                        <button onClick={(e) => { e.stopPropagation(); void handleApplyToStrategy(detailRecord) }} className="px-4 py-2 rounded-lg bg-[var(--color-bg-input)] text-[var(--color-text-primary)] border border-[var(--color-border)] text-[10px] font-black uppercase hover:border-[var(--color-accent)] hover:text-[var(--color-accent)] transition-all">应用回基础策略</button>
                         <button onClick={() => handleApplyToDashboard({ id: detailRecord.id, name: detailRecord.name, symbol: detailRecord.symbol, interval: detailRecord.interval })} className="px-4 py-2 rounded-lg bg-[var(--color-accent)]/10 text-[var(--color-accent)] border border-[var(--color-accent)]/30 text-[10px] font-black uppercase hover:bg-[var(--color-accent)] hover:text-white transition-all">应用到行情看板</button>
                       </div>
                     </div>
@@ -525,6 +769,10 @@ export function BacktestPage() {
                       { label: '盈亏比', value: `${displayResult.profit_factor}x`, color: 'var(--color-accent)' },
                       { label: '最大回撤', value: `-${displayResult.max_drawdown}%`, color: 'var(--color-short)' },
                       { label: '夏普比率', value: `${displayResult.sharpe_ratio}`, color: 'var(--color-text-primary)' },
+                      { label: 'Sortino', value: `${displayResult.sortino_ratio}`, color: 'var(--color-text-primary)' },
+                      { label: '最大连亏', value: `${displayResult.max_consecutive_losses}次`, color: displayResult.max_consecutive_losses >= 5 ? 'var(--color-short)' : 'var(--color-text-primary)' },
+                      { label: '回撤恢复', value: displayResult.max_dd_duration_hours >= 24 ? `${(displayResult.max_dd_duration_hours / 24).toFixed(1)}天` : `${displayResult.max_dd_duration_hours}h`, color: 'var(--color-text-primary)' },
+                      { label: '尾部比率', value: `${displayResult.tail_ratio}`, color: displayResult.tail_ratio >= 1 ? 'var(--color-long)' : displayResult.tail_ratio > 0 ? 'var(--color-short)' : 'var(--color-text-primary)' },
                       { label: '总成交笔数', value: `${displayResult.total_trades}`, color: 'var(--color-text-primary)' },
                     ].map((s) => (
                       <div key={s.label} className="bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-xl p-5 shadow-sm hover:translate-y-[-2px] transition-all"><div className="text-[10px] text-[var(--color-text-disabled)] uppercase tracking-widest font-bold mb-2">{s.label}</div><div className="text-3xl font-black font-[var(--font-mono)] tracking-tighter" style={{ color: s.color }}>{s.value}</div></div>
@@ -548,32 +796,122 @@ export function BacktestPage() {
             ) : (
               records.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center text-[var(--color-text-disabled)] opacity-30"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" className="mb-3"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="9" x2="15" y2="9"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="11" y2="17"/></svg><div className="text-sm font-bold uppercase tracking-widest">暂无回测记录</div></div>
+              ) : sortedRecords.length === 0 ? (
+                <div className="h-full flex flex-col items-center justify-center text-[var(--color-text-disabled)] opacity-30"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" className="mb-3"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg><div className="text-sm font-bold uppercase tracking-widest">{showFavoritesOnly && tagFilters.length > 0 ? '没有同时满足收藏和所选标签的记录' : showFavoritesOnly ? '暂无收藏记录' : `没有标签为「${tagFilters.join('、')}」的记录`}</div><button onClick={() => { setTagFilters([]); setShowFavoritesOnly(false) }} className="mt-3 text-xs px-4 py-2 rounded-lg border border-[var(--color-border)] text-[var(--color-text-secondary)] font-bold hover:border-[var(--color-accent)] hover:text-[var(--color-accent)]">清除过滤</button></div>
               ) : (
                 <div className="flex flex-col gap-4">
-                  <div className="flex flex-col gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-card)] p-4 shadow-sm sm:flex-row sm:items-center sm:justify-between">
-                    <div>
-                      <div className="text-[10px] font-black uppercase tracking-widest text-[var(--color-text-disabled)]">排序</div>
-                      <div className="mt-1 text-sm font-bold">默认按盈利率展示，可按各指标切换</div>
+                  <div className="flex flex-col gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-card)] p-4 shadow-sm">
+                    <div className="flex items-center justify-between">
+                      <div className="text-[10px] font-black uppercase tracking-widest text-[var(--color-text-disabled)]">筛选</div>
+                      {hasActiveFilter && (
+                        <button onClick={() => { setTagFilters([]); setShowFavoritesOnly(false) }} className="text-[10px] px-2 py-0.5 rounded-full border border-[var(--color-border)] text-[var(--color-text-disabled)] font-bold hover:border-[var(--color-short)] hover:text-[var(--color-short)] transition-all">清除筛选</button>
+                      )}
                     </div>
-                    <div className="flex items-center gap-2">
-                      <select value={historySortField} onChange={(e) => setHistorySortField(e.target.value as HistorySortField)} className="!w-auto !px-3 !py-2 text-xs font-bold">
-                        {HISTORY_SORT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-                      </select>
-                      <button onClick={() => setHistorySortDirection((prev) => prev === 'desc' ? 'asc' : 'desc')} className="px-3 py-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-input)] text-[10px] font-black uppercase text-[var(--color-text-secondary)] transition-all hover:border-[var(--color-accent)] hover:text-[var(--color-accent)]">
-                        {historySortDirection === 'desc' ? '高 → 低' : '低 → 高'}
-                      </button>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <button onClick={() => setShowFavoritesOnly(!showFavoritesOnly)} className={`text-[10px] px-2 py-0.5 rounded-full border font-bold transition-all ${showFavoritesOnly ? 'bg-yellow-400/15 text-yellow-400 border-yellow-400/50' : 'bg-transparent text-[var(--color-text-disabled)] border-[var(--color-border)] hover:border-yellow-400/50 hover:text-yellow-400'}`}>★ 收藏</button>
+                      <span className="w-px h-3.5 bg-[var(--color-border)]"></span>
+                      <button onClick={() => setTagFilters([])} className={`text-[10px] px-2 py-0.5 rounded-full border font-bold transition-all ${tagFilters.length === 0 ? 'bg-[var(--color-accent)] text-white border-[var(--color-accent)]' : 'bg-transparent text-[var(--color-text-disabled)] border-[var(--color-border)] hover:border-[var(--color-accent)]'}`}>全部标签</button>
+                      {allTags.map((tag) => (
+                        <button key={tag} onClick={() => setTagFilters((prev) => prev.includes(tag) ? prev.filter((t) => t !== tag) : [...prev, tag])} className={`text-[10px] px-2 py-0.5 rounded-full border font-bold transition-all ${tagFilters.includes(tag) ? 'bg-[var(--color-accent)] text-white border-[var(--color-accent)]' : 'bg-transparent text-[var(--color-text-disabled)] border-[var(--color-border)] hover:border-[var(--color-accent)]'}`}>{tag}</button>
+                      ))}
                     </div>
-                  </div>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {sortedRecords.map((r) => (
-                    <div key={r.id} onClick={() => handleViewDetail(r.id)} className="bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-xl p-5 hover:border-[var(--color-accent)] cursor-pointer transition-all shadow-sm group">
-                      <div className="flex items-center justify-between mb-4">
-                        <div className="min-w-0">{editingId === r.id ? (<input type="text" value={editName} onChange={(e) => setEditName(e.target.value)} onBlur={() => handleRename(r.id)} onKeyDown={(e) => { if (e.key === 'Enter') handleRename(r.id); if (e.key === 'Escape') setEditingId(null) }} onClick={(e) => e.stopPropagation()} autoFocus className="text-sm font-black !py-0.5 !px-1 w-full" />) : (<div className="text-sm font-black truncate group-hover:text-[var(--color-accent)] transition-colors">{r.name}</div>)}<div className="text-[10px] text-[var(--color-text-disabled)] font-bold uppercase mt-1">{r.symbol} · {r.interval} · {r.leverage}x</div></div>
-                        <div className="flex items-center gap-1"><button onClick={(e) => { e.stopPropagation(); void handleExportMarkdown(r.id) }} className="px-2 py-1 rounded-md bg-[var(--color-bg-input)] text-[9px] font-black uppercase text-[var(--color-text-secondary)] border border-[var(--color-border)] hover:text-[var(--color-accent)] hover:border-[var(--color-accent)] transition-all">MD</button><button onClick={(e) => { e.stopPropagation(); deleteRecord(r.id) }} className="p-1.5 rounded-full hover:bg-[var(--color-short)]/10 text-[var(--color-text-disabled)] hover:text-[var(--color-short)] transition-all"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button></div>
+                    {hasActiveFilter && (
+                      <div className="text-[10px] text-[var(--color-text-disabled)] font-bold">
+                        {filteredRecords.length} / {records.length} 条记录
                       </div>
-                      <div className="flex items-end justify-between"><div><div className="text-[10px] text-[var(--color-text-disabled)] font-bold uppercase mb-1">总收益率</div><div className={`text-xl font-black font-[var(--font-mono)] ${r.total_return_pct >= 0 ? 'text-[var(--color-long)]' : 'text-[var(--color-short)]'}`}>{r.total_return_pct > 0 ? '+' : ''}{r.total_return_pct}%</div></div><div className="text-right"><div className="text-[9px] text-[var(--color-text-disabled)] font-bold uppercase mb-1">胜率</div><div className="text-sm font-black">{r.win_rate}%</div></div></div>
-                    </div>
-                  ))}
+                    )}
+                  </div>
+                  <div className="overflow-x-auto rounded-xl border border-[var(--color-border)]">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-[var(--color-border)] bg-[var(--color-bg-input)]">
+                          <th className="px-3 py-2.5 text-left font-black uppercase text-[var(--color-text-disabled)] w-7">★</th>
+                          <th className="px-3 py-2.5 text-left font-black uppercase text-[var(--color-text-disabled)]">策略名称</th>
+                          {HISTORY_SORT_OPTIONS.map((opt) => (
+                            <th
+                              key={opt.value}
+                              onClick={() => {
+                                if (historySortField === opt.value) setHistorySortDirection((p) => p === 'desc' ? 'asc' : 'desc')
+                                else { setHistorySortField(opt.value as HistorySortField); setHistorySortDirection('desc') }
+                              }}
+                              className={`px-3 py-2.5 text-right font-black uppercase cursor-pointer select-none transition-all hover:text-[var(--color-accent)] whitespace-nowrap ${historySortField === opt.value ? 'text-[var(--color-accent)]' : 'text-[var(--color-text-disabled)]'}`}
+                            >
+                              {opt.label}{historySortField === opt.value ? (historySortDirection === 'desc' ? ' ↓' : ' ↑') : ''}
+                            </th>
+                          ))}
+                          <th className="px-3 py-2.5 text-right font-black uppercase text-[var(--color-text-disabled)] w-16">操作</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {sortedRecords.map((r) => (
+                          <tr key={r.id} className="border-b border-[var(--color-border)] hover:bg-[var(--color-bg-input)] transition-colors group">
+                            <td className="px-3 py-2">
+                              <button onClick={() => void toggleFavorite(r.id)} className={`text-sm leading-none transition-all ${r.is_favorite ? 'text-yellow-400' : 'text-[var(--color-border)]'}`}>{r.is_favorite ? '★' : '☆'}</button>
+                            </td>
+                            <td className="px-3 py-2 min-w-0">
+                              {editingId === r.id ? (
+                                <input type="text" value={editName} onChange={(e) => setEditName(e.target.value)} onBlur={() => handleRename(r.id)} onKeyDown={(e) => { if (e.key === 'Enter') handleRename(r.id); if (e.key === 'Escape') setEditingId(null) }} autoFocus className="text-xs font-black !py-0.5 !px-1 w-full" />
+                              ) : (
+                                <div onClick={() => handleViewDetail(r.id)} className="font-black truncate cursor-pointer group-hover:text-[var(--color-accent)] transition-colors">{r.name}</div>
+                              )}
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                              <div className="text-[9px] text-[var(--color-text-disabled)] font-bold uppercase">{r.symbol} · {r.interval} · {r.leverage}x</div>
+                              <span className={`text-[8px] px-1 py-0 rounded border font-black ${r.strategy_mode === 'short_only' ? 'text-red-400 border-red-400/40' : r.strategy_mode === 'bidirectional' ? 'text-green-400 border-green-400/40' : r.strategy_mode === 'dca' ? 'text-blue-400 border-blue-400/40' : r.strategy_mode === 'martingale' ? 'text-yellow-400 border-yellow-400/40' : 'text-[var(--color-text-disabled)] border-[var(--color-border)]'}`}>{r.strategy_mode === 'short_only' ? '做空' : r.strategy_mode === 'bidirectional' ? '双向' : r.strategy_mode === 'dca' ? 'DCA' : r.strategy_mode === 'martingale' ? '马丁' : '做多'}</span>
+                            </div>
+                              {r.tags.length > 0 && (
+                                <div className="flex flex-wrap gap-0.5 mt-0.5">
+                                  {r.tags.map((tag) => (
+                                    <span key={tag} className="flex items-center gap-0.5 text-[9px] px-1 py-0 rounded-full bg-[var(--color-bg-input)] border border-[var(--color-border)] text-[var(--color-text-secondary)] font-bold">
+                                      <span onClick={() => setTagFilters((prev) => prev.includes(tag) ? prev : [...prev, tag])} className="hover:text-[var(--color-accent)] cursor-pointer">{tag}</span>
+                                      <button onClick={() => void updateTags(r.id, r.tags.filter((t) => t !== tag))} className="text-[var(--color-text-disabled)] hover:text-[var(--color-short)] leading-none">×</button>
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                              {addingTagFor === r.id ? (
+                                <div className="flex items-center gap-1 mt-0.5">
+                                  <input type="text" value={newTagInput} onChange={(e) => setNewTagInput(e.target.value)} onKeyDown={(e) => {
+                                    if (e.key === 'Enter' && newTagInput.trim()) {
+                                      const tag = newTagInput.trim()
+                                      if (!r.tags.includes(tag)) void updateTags(r.id, [...r.tags, tag])
+                                      setNewTagInput(''); setAddingTagFor(null)
+                                    }
+                                    if (e.key === 'Escape') { setNewTagInput(''); setAddingTagFor(null) }
+                                  }} placeholder="回车确认" className="!w-24 !px-1.5 !py-0.5 text-[9px] font-bold" autoFocus />
+                                  <button onClick={() => { if (newTagInput.trim() && !r.tags.includes(newTagInput.trim())) void updateTags(r.id, [...r.tags, newTagInput.trim()]); setNewTagInput(''); setAddingTagFor(null) }} className="text-[9px] px-1 py-0.5 rounded bg-[var(--color-accent)] text-white font-bold">✓</button>
+                                  <button onClick={() => { setNewTagInput(''); setAddingTagFor(null) }} className="text-[9px] text-[var(--color-text-disabled)] font-bold">✕</button>
+                                </div>
+                              ) : (
+                                <button onClick={() => { setAddingTagFor(r.id); setNewTagInput('') }} className="text-[9px] text-[var(--color-text-disabled)] hover:text-[var(--color-accent)] font-bold mt-0.5">+ 标签</button>
+                              )}
+                            </td>
+                            <td className={`px-3 py-2 text-right font-black font-[family-name:var(--font-mono)] whitespace-nowrap ${r.total_return_pct >= 0 ? 'text-[var(--color-long)]' : 'text-[var(--color-short)]'}`}>{r.total_return_pct > 0 ? '+' : ''}{r.total_return_pct}%</td>
+                            <td className="px-3 py-2 text-right font-black font-[family-name:var(--font-mono)] whitespace-nowrap">{r.win_rate}%</td>
+                            <td className="px-3 py-2 text-right font-black font-[family-name:var(--font-mono)] whitespace-nowrap">{r.profit_factor}</td>
+                            <td className="px-3 py-2 text-right font-black font-[family-name:var(--font-mono)] whitespace-nowrap text-[var(--color-short)]">{r.max_drawdown}%</td>
+                            <td className="px-3 py-2 text-right font-black font-[family-name:var(--font-mono)] whitespace-nowrap">{r.sharpe_ratio}</td>
+                            <td className="px-3 py-2 text-right font-black font-[family-name:var(--font-mono)] whitespace-nowrap">{r.sortino_ratio}</td>
+                            <td className={`px-3 py-2 text-right font-black font-[family-name:var(--font-mono)] whitespace-nowrap ${r.max_consecutive_losses >= 5 ? 'text-[var(--color-short)]' : ''}`}>{r.max_consecutive_losses}</td>
+                            <td className="px-3 py-2 text-right font-black font-[family-name:var(--font-mono)] whitespace-nowrap text-[var(--color-text-secondary)]">{r.max_dd_duration_hours >= 24 ? `${(r.max_dd_duration_hours / 24).toFixed(1)}d` : `${r.max_dd_duration_hours}h`}</td>
+                            <td className={`px-3 py-2 text-right font-black font-[family-name:var(--font-mono)] whitespace-nowrap ${r.tail_ratio >= 1 ? 'text-[var(--color-long)]' : r.tail_ratio > 0 ? 'text-[var(--color-short)]' : ''}`}>{r.tail_ratio}</td>
+                            <td className="px-3 py-2 text-right font-black font-[family-name:var(--font-mono)] whitespace-nowrap">{r.total_trades}</td>
+                            <td className="px-3 py-2 text-right font-black font-[family-name:var(--font-mono)] whitespace-nowrap text-[var(--color-text-secondary)]">{r.avg_holding_hours}h</td>
+                            <td className="px-3 py-2 text-right font-black font-[family-name:var(--font-mono)] whitespace-nowrap">{r.position_pct}%</td>
+                            <td className="px-3 py-2 text-right font-black font-[family-name:var(--font-mono)] whitespace-nowrap">{r.leverage}×</td>
+                            <td className="px-3 py-2 text-right font-black whitespace-nowrap text-[var(--color-text-secondary)]">{new Date(r.created_at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</td>
+                            <td className="px-3 py-2 text-right">
+                              <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <button onClick={() => void handleExportMarkdown(r.id)} className="px-1.5 py-0.5 rounded bg-[var(--color-bg-input)] text-[9px] font-black uppercase text-[var(--color-text-secondary)] border border-[var(--color-border)] hover:text-[var(--color-accent)] hover:border-[var(--color-accent)] transition-all">MD</button>
+                                <button onClick={() => deleteRecord(r.id)} className="p-1 rounded-full hover:bg-[var(--color-short)]/10 text-[var(--color-text-disabled)] hover:text-[var(--color-short)] transition-all"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                        {sortedRecords.length === 0 && (
+                          <tr><td colSpan={HISTORY_SORT_OPTIONS.length + 3} className="px-4 py-8 text-center text-[var(--color-text-disabled)] font-bold">暂无回测记录</td></tr>
+                        )}
+                      </tbody>
+                    </table>
                   </div>
                 </div>
               )

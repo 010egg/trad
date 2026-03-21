@@ -5,6 +5,17 @@ interface TradeSettings {
   trade_mode: string  // SIMULATED / LIVE
   default_market: string  // SPOT / FUTURES
   default_leverage: number
+  llm_enabled: boolean
+  llm_provider: string
+  llm_base_url: string
+  llm_model: string
+  llm_system_prompt: string
+  llm_has_api_key: boolean
+  llm_api_key_masked: string | null
+}
+
+type TradeSettingsUpdate = Partial<TradeSettings> & {
+  llm_api_key?: string
 }
 
 interface TradeState {
@@ -15,7 +26,7 @@ interface TradeState {
   loading: boolean
   error: string | null
   fetchSettings: () => Promise<void>
-  updateSettings: (updates: Partial<TradeSettings>) => Promise<void>
+  updateSettings: (updates: TradeSettingsUpdate) => Promise<void>
   fetchBalance: () => Promise<void>
 }
 

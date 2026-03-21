@@ -287,6 +287,10 @@ async def test_records_crud(client, monkeypatch):
     assert len(records) == 1
     assert records[0]["name"] == "测试策略"
     assert records[0]["leverage"] == 2
+    assert "sortino_ratio" in records[0]
+    assert "max_consecutive_losses" in records[0]
+    assert "max_dd_duration_hours" in records[0]
+    assert "tail_ratio" in records[0]
 
     # 3. 查看详情
     resp = await client.get(f"/api/v1/backtest/records/{record_id}", headers=headers)
@@ -294,6 +298,10 @@ async def test_records_crud(client, monkeypatch):
     detail = resp.json()["data"]
     assert detail["symbol"] == "BTCUSDT"
     assert "trades" in detail
+    assert "sortino_ratio" in detail
+    assert "max_consecutive_losses" in detail
+    assert "max_dd_duration_hours" in detail
+    assert "tail_ratio" in detail
 
     # 4. 修改名称
     resp = await client.put(f"/api/v1/backtest/records/{record_id}", json={
