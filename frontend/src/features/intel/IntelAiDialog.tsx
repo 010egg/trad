@@ -41,8 +41,8 @@ function renderContent(content: string) {
     if (trimmed.startsWith('#') || (trimmed.startsWith('【') && trimmed.endsWith('】'))) {
       const text = trimmed.replace(/^#+\s+/, '').replace(/[【】]/g, '')
       return (
-        <h4 key={i} className="mt-2 mb-1 flex items-center gap-2 text-[11px] font-black uppercase tracking-[0.18em] text-blue-300">
-          <span className="h-2.5 w-1 rounded-full bg-blue-500/50" />
+        <h4 key={i} className="mt-3 mb-1.5 text-[10px] font-black uppercase tracking-[0.2em] text-blue-400 flex items-center gap-2">
+          <span className="w-3 h-px bg-blue-500/60" />
           {text}
         </h4>
       )
@@ -51,15 +51,15 @@ function renderContent(content: string) {
     if (/^([-*•]\s+|\d+[.)]\s+)/.test(trimmed)) {
       const text = trimmed.replace(/^([-*•]\s+|\d+[.)]\s+)/, '')
       return (
-        <div key={i} className="flex gap-2 py-0.5 text-[13px] leading-5 text-[#c8d0db]">
-          <span className="mt-[5px] h-1.5 w-1.5 shrink-0 rounded-full bg-blue-400/80" />
+        <div key={i} className="flex gap-2 py-0.5 text-[12px] leading-5 text-[#bbb]">
+          <span className="text-[#555] font-[var(--font-mono)] shrink-0">—</span>
           <span>{processBold(text)}</span>
         </div>
       )
     }
 
     return (
-      <p key={i} className="mb-1 text-[13px] leading-6 text-[#aeb7c4] last:mb-0">
+      <p key={i} className="mb-1.5 text-[12px] leading-[1.7] text-[#999] last:mb-0">
         {processBold(trimmed)}
       </p>
     )
@@ -81,9 +81,9 @@ function processBold(text: string) {
 }
 
 function signalTone(signal: string) {
-  if (signal === 'BULLISH') return 'text-[var(--color-long)] border-[var(--color-long)]/30 bg-[var(--color-long)]/10'
-  if (signal === 'BEARISH') return 'text-[var(--color-short)] border-[var(--color-short)]/30 bg-[var(--color-short)]/10'
-  return 'text-amber-300 border-amber-300/20 bg-amber-300/10'
+  if (signal === 'BULLISH') return 'text-[var(--color-long)] border-[var(--color-long)]/40 bg-[var(--color-long)]/8'
+  if (signal === 'BEARISH') return 'text-[var(--color-short)] border-[var(--color-short)]/40 bg-[var(--color-short)]/8'
+  return 'text-amber-400 border-amber-400/30 bg-amber-400/8'
 }
 
 export function IntelAiDialog() {
@@ -98,6 +98,7 @@ export function IntelAiDialog() {
   const [error, setError] = useState('')
   const [meta, setMeta] = useState<{ model: string; latency_ms: number } | null>(null)
   const bodyRef = useRef<HTMLDivElement | null>(null)
+  const inputRef = useRef<HTMLTextAreaElement | null>(null)
   const sessionKey = item?.id || GLOBAL_SESSION_KEY
   const quickPrompts = item ? ITEM_QUICK_PROMPTS : GLOBAL_QUICK_PROMPTS
 
@@ -118,6 +119,12 @@ export function IntelAiDialog() {
     if (!bodyRef.current) return
     bodyRef.current.scrollTop = bodyRef.current.scrollHeight
   }, [messages, loading, open])
+
+  useEffect(() => {
+    if (open) {
+      setTimeout(() => inputRef.current?.focus(), 100)
+    }
+  }, [open])
 
   const askAi = async (question: string, silent = false) => {
     if (!question.trim() || loading) return
@@ -161,6 +168,7 @@ export function IntelAiDialog() {
 
   return (
     <>
+      {/* 触发按钮 */}
       <div className="pointer-events-none fixed bottom-5 right-5 z-[92] flex items-center">
         <button
           type="button"
@@ -187,187 +195,183 @@ export function IntelAiDialog() {
         </button>
       </div>
 
+      {/* 侧边栏面板 */}
       <div
-        className={`pointer-events-none fixed inset-y-0 right-0 z-[91] flex justify-end px-3 pb-3 pt-[60px] transition-transform duration-300 ease-out ${
-          open ? 'translate-x-0' : 'translate-x-[calc(100%+24px)]'
+        className={`pointer-events-none fixed inset-y-0 right-0 z-[91] flex justify-end transition-transform duration-200 ease-out ${
+          open ? 'translate-x-0' : 'translate-x-full'
         }`}
       >
-        <div className="pointer-events-auto flex h-full w-[min(460px,calc(100vw-1.5rem))] items-stretch">
-          <aside className="flex min-w-0 flex-1 flex-col overflow-hidden rounded-[30px] border border-[#243247] bg-[linear-gradient(180deg,#0b0f15_0%,#06080c_100%)] shadow-[0_20px_80px_rgba(0,0,0,0.72)]">
-            <div className="shrink-0 border-b border-[#1b2533] bg-[linear-gradient(180deg,#101826_0%,#0a111b_100%)] px-4 py-4">
-              <div className="mb-3 flex items-start justify-between gap-3">
-                <div className="min-w-0 flex-1">
-                  <div className="mb-1 flex items-center gap-2">
-                    <div className="h-2 w-2 rounded-sm bg-blue-500 animate-pulse" />
-                    <span className="text-[10px] font-black uppercase tracking-[0.24em] text-blue-300">全局 AI 情报舱</span>
-                  </div>
-                  <div className="text-[10px] font-bold font-[var(--font-mono)] text-[#617086]">
-                    跨页面保留上下文，随时继续追问当前情报
-                    {meta ? ` · ${meta.model} · ${meta.latency_ms}ms` : ''}
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={close}
-                  className="flex h-8 w-8 items-center justify-center rounded-full border border-[#263549] bg-[#0b1320] text-[#88a6c7] transition-colors hover:border-blue-400/40 hover:text-white"
-                  title="收起 AI 情报舱"
-                >
-                  <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-                    <path d="m6 6 12 12M18 6 6 18" />
-                  </svg>
-                </button>
-              </div>
+        <div className="pointer-events-auto flex h-full w-[min(440px,calc(100vw-1.5rem))] flex-col border-l border-[#222] bg-[#050505]">
 
-              {item ? (
-                <div className="rounded-2xl border border-[#1f2b3d] bg-[#09111c]/80 p-3">
-                  <div className="mb-2 flex flex-wrap items-center gap-2">
-                    <span className={`px-2 py-0.5 text-[9px] font-black uppercase border ${signalTone(item.signal)}`}>{item.signal}</span>
-                    <span className="text-[9px] font-bold font-[var(--font-mono)] uppercase tracking-[0.18em] text-[#70809a]">{item.source_name}</span>
-                    {item.symbols.map((symbol) => (
-                      <span key={symbol} className="text-[10px] font-black font-[var(--font-mono)] text-blue-300">
-                        #{symbol.replace('USDT', '')}
-                      </span>
-                    ))}
-                  </div>
-                  <h3 className="line-clamp-2 text-sm font-black leading-tight text-white">{item.title}</h3>
-                </div>
-              ) : (
-                <div className="rounded-2xl border border-dashed border-[#243247] bg-[#09111c]/35 px-3 py-4 text-[12px] leading-6 text-[#7c8798]">
-                  当前没有绑定具体情报，你可以直接把它当成全局市场助手使用；如果之后在情报页点某条消息的 `AI`，这里会自动切到那条情报的上下文。
-                </div>
+          {/* 顶部标题栏 */}
+          <div className="h-12 shrink-0 border-b border-[#222] bg-[#0A0A0A] flex items-center justify-between px-4">
+            <div className="flex items-center gap-3">
+              <div className="w-1.5 h-1.5 bg-blue-500 animate-pulse" />
+              <span className="text-[10px] font-black uppercase tracking-[0.22em] text-white font-[var(--font-mono)]">AI 情报助手</span>
+              {meta && (
+                <span className="text-[9px] font-bold font-[var(--font-mono)] text-[#555]">
+                  {meta.latency_ms}ms
+                </span>
               )}
             </div>
+            <button
+              type="button"
+              onClick={close}
+              className="w-7 h-7 flex items-center justify-center border border-[#333] text-[#666] hover:border-[#555] hover:text-white transition-colors"
+              title="收起"
+            >
+              <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="m6 6 12 12M18 6 6 18" />
+              </svg>
+            </button>
+          </div>
 
-            <div ref={bodyRef} className="flex-1 overflow-y-auto bg-[radial-gradient(circle_at_top,rgba(59,130,246,0.08),transparent_28%),linear-gradient(180deg,#06090d_0%,#040608_100%)] px-4 py-4">
-              {!item && messages.length === 0 ? (
-                <div className="flex h-full items-center justify-center">
-                  <div className="max-w-[320px] rounded-[28px] border border-[#1f2b3d] bg-[#0a1017]/90 p-5 text-left">
-                    <div className="mb-3 flex items-center gap-2 text-[10px] font-black uppercase tracking-[0.22em] text-blue-300">
-                      <span className="h-2 w-2 rounded-full bg-blue-400 animate-pulse" />
-                      全局 AI 助手已待命
-                    </div>
-                    <div className="text-[13px] leading-6 text-[#93a1b3]">
-                      现在就可以直接提问市场、风险或交易观察相关问题。如果你想围绕某条资讯深入讨论，再去情报页点对应消息的 `AI`。
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => navigate('/intel')}
-                      className="mt-4 inline-flex items-center gap-2 rounded-full border border-blue-500/30 bg-blue-500/10 px-4 py-2 text-[10px] font-black uppercase tracking-[0.2em] text-blue-200 transition-colors hover:bg-blue-500/16"
-                    >
-                      前往情报页绑定消息
-                      <span aria-hidden="true">-&gt;</span>
-                    </button>
-                  </div>
-                </div>
-              ) : messages.length === 0 && loading ? (
-                <div className="rounded-xl border border-[#1f2b3d] bg-[#0b1016] px-4 py-4 text-[11px] font-[var(--font-mono)] uppercase tracking-[0.22em] text-[#7f8da0] animate-pulse">
-                  {item ? '正在初始化 AI 市场分析...' : '正在连接全局 AI 助手...'}
-                </div>
-              ) : (
-                <div className="space-y-4">
-                  {messages.map((message, index) => (
-                    <div
-                      key={`${message.role}-${index}`}
-                      className={`${message.role === 'assistant' ? '' : 'pl-6'}`}
-                    >
-                      <div className="mb-2 flex items-center gap-2">
-                        <div
-                          className={`flex h-6 w-6 items-center justify-center rounded-md text-[9px] font-black ${
-                            message.role === 'assistant'
-                              ? 'bg-blue-500 text-white'
-                              : 'bg-[#223046] text-[#dce7f8]'
-                          }`}
-                        >
-                          {message.role === 'assistant' ? 'AI' : 'ME'}
-                        </div>
-                        <span className="text-[9px] font-black uppercase tracking-[0.22em] text-[#536273]">
-                          {message.role === 'assistant' ? 'Intelligence' : 'Prompt'}
-                        </span>
-                      </div>
-
-                      <div
-                        className={`rounded-2xl border px-4 py-3 ${
-                          message.role === 'assistant'
-                            ? 'border-[#1f2b3d] bg-[#0b1016]'
-                            : 'border-[#27405f] bg-[#0c1826]'
-                        }`}
-                      >
-                        {message.role === 'assistant' ? (
-                          <div className="flow-root">{renderContent(message.content)}</div>
-                        ) : (
-                          <div className="whitespace-pre-wrap text-[13px] font-bold leading-6 text-[#dce7f8]">
-                            {message.content}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-
-                  {loading && messages.length > 0 && (
-                    <div className="rounded-2xl border border-[#1f2b3d] bg-[#0b1016] px-4 py-4">
-                      <div className="flex gap-1">
-                        <div className="h-1.5 w-1.5 rounded-full bg-blue-500/60 animate-bounce" style={{ animationDelay: '0ms' }} />
-                        <div className="h-1.5 w-1.5 rounded-full bg-blue-500/60 animate-bounce" style={{ animationDelay: '140ms' }} />
-                        <div className="h-1.5 w-1.5 rounded-full bg-blue-500/60 animate-bounce" style={{ animationDelay: '280ms' }} />
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-
-            <div className="shrink-0 border-t border-[#1b2533] bg-[#08101a] px-4 py-4">
-              <div className="mb-3 flex flex-wrap gap-1.5">
-                {quickPrompts.map((prompt) => (
-                  <button
-                    key={prompt}
-                    type="button"
-                    disabled={loading}
-                    onClick={() => void askAi(prompt)}
-                    className="rounded-full border border-[#243247] bg-[#0d1420] px-2.5 py-1 text-[10px] font-black text-[#90a3bf] transition-colors hover:border-blue-500/40 hover:text-blue-200 disabled:opacity-35"
-                  >
-                    {prompt}
-                  </button>
+          {/* 情报上下文卡片 */}
+          {item ? (
+            <div className="shrink-0 border-b border-[#222] px-4 py-3 bg-[#0A0A0A]">
+              <div className="flex flex-wrap items-center gap-2 mb-1.5">
+                <span className={`px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wider border ${signalTone(item.signal)}`}>{item.signal}</span>
+                <span className="text-[9px] font-bold font-[var(--font-mono)] text-[#555] uppercase">{item.source_name}</span>
+                {item.symbols.map((symbol) => (
+                  <span key={symbol} className="text-[9px] font-black font-[var(--font-mono)] text-blue-400 bg-blue-400/8 border border-blue-400/20 px-1">
+                    {symbol.replace('USDT', '')}
+                  </span>
                 ))}
               </div>
+              <p className="line-clamp-2 text-[12px] font-bold text-[#ccc] leading-snug">{item.title}</p>
+            </div>
+          ) : (
+            <div className="shrink-0 border-b border-[#222] px-4 py-3 bg-[#0A0A0A]">
+              <p className="text-[11px] font-[var(--font-mono)] text-[#555] leading-relaxed">
+                // 无绑定情报 — 全局市场助手模式
+              </p>
+            </div>
+          )}
 
-              <div className="relative">
-                <textarea
-                  value={input}
-                  onChange={(event) => setInput(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter' && !event.shiftKey) {
-                      event.preventDefault()
-                      const nextQuestion = input
-                      setInput('')
-                      void askAi(nextQuestion)
-                    }
-                  }}
-                  rows={3}
-                  placeholder={item ? '继续追问这条情报...' : '直接问市场问题，或先去情报页绑定一条消息...'}
-                  className="w-full resize-none rounded-2xl border border-[#243247] bg-[#0d1420] px-4 py-3 pr-24 text-[13px] leading-6 text-white outline-none transition-colors placeholder:text-[#4f5f73] focus:border-blue-500 disabled:opacity-50"
-                />
+          {/* 消息区域 */}
+          <div ref={bodyRef} className="flex-1 overflow-y-auto custom-scrollbar px-4 py-4 space-y-3">
+            {!item && messages.length === 0 ? (
+              <div className="flex flex-col gap-4 pt-4">
+                <div className="border border-[#222] bg-[#0A0A0A] p-4">
+                  <div className="text-[9px] font-black uppercase tracking-[0.22em] text-blue-400 font-[var(--font-mono)] mb-3 flex items-center gap-2">
+                    <span className="w-1.5 h-1.5 bg-blue-500 animate-pulse" />
+                    全局助手已就绪
+                  </div>
+                  <p className="text-[12px] text-[#777] leading-relaxed">
+                    可直接提问市场、风险或交易观察。如需围绕特定情报深入讨论，前往情报页点击 <code className="text-blue-400 font-[var(--font-mono)]">AI</code> 按钮绑定上下文。
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => navigate('/intel')}
+                    className="mt-3 text-[9px] font-black uppercase tracking-[0.18em] font-[var(--font-mono)] text-[#666] hover:text-white border border-[#333] px-3 py-1.5 hover:border-[#555] transition-colors"
+                  >
+                    前往情报页 →
+                  </button>
+                </div>
+              </div>
+            ) : messages.length === 0 && loading ? (
+              <div className="border-l-2 border-blue-500/40 pl-3 py-1">
+                <div className="text-[10px] font-[var(--font-mono)] uppercase tracking-[0.18em] text-[#555] flex items-center gap-2">
+                  <span className="inline-flex gap-0.5">
+                    <span className="w-1 h-1 bg-blue-500/60 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                    <span className="w-1 h-1 bg-blue-500/60 rounded-full animate-bounce" style={{ animationDelay: '140ms' }} />
+                    <span className="w-1 h-1 bg-blue-500/60 rounded-full animate-bounce" style={{ animationDelay: '280ms' }} />
+                  </span>
+                  正在分析...
+                </div>
+              </div>
+            ) : (
+              <>
+                {messages.map((message, index) => (
+                  <div key={`${message.role}-${index}`} className={`${message.role === 'user' ? 'ml-4' : ''}`}>
+                    <div className="flex items-center gap-2 mb-1.5">
+                      <span className={`text-[9px] font-black font-[var(--font-mono)] uppercase tracking-[0.18em] ${message.role === 'assistant' ? 'text-blue-400' : 'text-[#555]'}`}>
+                        {message.role === 'assistant' ? 'INTEL' : 'YOU'}
+                      </span>
+                    </div>
+                    <div className={`border-l-2 pl-3 py-0.5 ${message.role === 'assistant' ? 'border-blue-500/50' : 'border-[#333]'}`}>
+                      {message.role === 'assistant' ? (
+                        <div className="flow-root">{renderContent(message.content)}</div>
+                      ) : (
+                        <p className="text-[12px] font-bold text-[#ddd] leading-relaxed whitespace-pre-wrap">
+                          {message.content}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                ))}
+
+                {loading && messages.length > 0 && (
+                  <div className="ml-0 border-l-2 border-blue-500/30 pl-3 py-1">
+                    <span className="text-[9px] font-[var(--font-mono)] text-[#555] uppercase tracking-widest flex items-center gap-1.5">
+                      <span className="inline-flex gap-0.5">
+                        <span className="w-1 h-1 bg-blue-500/60 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                        <span className="w-1 h-1 bg-blue-500/60 rounded-full animate-bounce" style={{ animationDelay: '140ms' }} />
+                        <span className="w-1 h-1 bg-blue-500/60 rounded-full animate-bounce" style={{ animationDelay: '280ms' }} />
+                      </span>
+                    </span>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
+          {/* 底部输入区 */}
+          <div className="shrink-0 border-t border-[#222] bg-[#0A0A0A] px-4 py-3">
+            {/* 快捷提示 */}
+            <div className="flex flex-wrap gap-1 mb-3">
+              {quickPrompts.map((prompt) => (
                 <button
+                  key={prompt}
                   type="button"
-                  disabled={loading || !input.trim()}
-                  onClick={() => {
+                  disabled={loading}
+                  onClick={() => void askAi(prompt)}
+                  className="border border-[#2a2a2a] bg-[#111] px-2 py-1 text-[9px] font-bold text-[#777] hover:border-[#444] hover:text-white transition-colors disabled:opacity-30 font-[var(--font-mono)]"
+                >
+                  {prompt}
+                </button>
+              ))}
+            </div>
+
+            {/* 输入框 */}
+            <div className="flex gap-0 border border-[#333] focus-within:border-blue-500/60 transition-colors bg-[#111]">
+              <span className="flex items-start pt-3 pl-3 text-[12px] font-black font-[var(--font-mono)] text-[#444] select-none shrink-0">&gt;</span>
+              <textarea
+                ref={inputRef}
+                value={input}
+                onChange={(event) => setInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault()
                     const nextQuestion = input
                     setInput('')
                     void askAi(nextQuestion)
-                  }}
-                  className="absolute bottom-3 right-3 rounded-xl bg-white px-4 py-2 text-[10px] font-black uppercase tracking-[0.2em] text-black transition-colors hover:bg-gray-200 disabled:bg-[#243247] disabled:text-[#56657a]"
-                >
-                  发送
-                </button>
-              </div>
-
-              {error && (
-                <div className="mt-3 rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-[11px] font-[var(--font-mono)] text-red-200">
-                  [错误] {error}
-                </div>
-              )}
+                  }
+                }}
+                rows={2}
+                placeholder={item ? '继续追问这条情报...' : '提问市场问题...'}
+                className="flex-1 resize-none bg-transparent border-0 px-2 py-3 text-[12px] leading-5 text-white outline-none placeholder:text-[#3a3a3a] font-[var(--font-mono)]"
+              />
+              <button
+                type="button"
+                disabled={loading || !input.trim()}
+                onClick={() => {
+                  const nextQuestion = input
+                  setInput('')
+                  void askAi(nextQuestion)
+                }}
+                className="self-end mb-1.5 mr-1.5 px-3 py-1.5 bg-white text-black text-[9px] font-black uppercase tracking-[0.2em] hover:bg-gray-200 disabled:bg-[#222] disabled:text-[#555] transition-colors"
+              >
+                发送
+              </button>
             </div>
-          </aside>
+
+            {error && (
+              <div className="mt-2 border border-[var(--color-danger)]/30 bg-[var(--color-danger)]/8 px-3 py-2 text-[10px] font-[var(--font-mono)] text-[var(--color-danger)]">
+                [ERR] {error}
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </>
