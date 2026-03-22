@@ -110,7 +110,10 @@ export function DashboardPage() {
     const currentPrice = (p.symbol === symbol && latestKline?.close) ? latestKline.close : p.current_price
     const direction = p.side === 'SHORT' ? -1 : 1
     const pnl = (p.entry_price > 0 && currentPrice > 0) ? (currentPrice - p.entry_price) * direction * p.quantity : p.unrealized_pnl
-    return { currentPrice, pnl }
+    const floatingRatio = (p.entry_price > 0 && currentPrice > 0)
+      ? ((currentPrice - p.entry_price) / p.entry_price) * direction * 100
+      : p.price_change_pct * direction
+    return { currentPrice, pnl, floatingRatio }
   }
 
   return (
@@ -172,31 +175,32 @@ export function DashboardPage() {
               <Panel defaultSize={30} minSize={10}>
                 <div className="flex flex-col h-full bg-[var(--color-bg-card)] border-t border-[var(--color-border)] overflow-hidden">
                   <div className="px-4 py-2 border-b border-[var(--color-border)] flex items-center justify-between h-8 bg-[var(--color-bg-hover)]/30 shrink-0">
-                    <span className="text-[9px] font-bold uppercase text-[var(--color-text-disabled)] tracking-widest">Active Positions</span>
-                    <button onClick={() => void fetchPositions()} disabled={positionsLoading} className="text-[9px] font-bold text-[var(--color-accent)] uppercase">Refresh</button>
+                    <span className="text-[10px] font-bold text-[var(--color-text-disabled)] tracking-[0.18em]">当前持仓</span>
+                    <button onClick={() => void fetchPositions()} disabled={positionsLoading} className="text-[10px] font-bold text-[var(--color-accent)]">刷新</button>
                   </div>
                   <div className="flex-1 overflow-auto custom-scrollbar">
                     <table className="w-full text-left border-collapse min-w-[700px]">
                       <thead className="sticky top-0 bg-[var(--color-bg-card)] z-10 shadow-sm">
                         <tr className="text-[8px] text-[var(--color-text-disabled)] uppercase font-bold border-b border-[var(--color-border)]">
-                          <th className="px-4 py-1.5">Market</th>
-                          <th className="px-3 py-1.5 text-center">Side</th>
-                          <th className="px-3 py-1.5 text-right">Size</th>
-                          <th className="px-3 py-1.5 text-right">Entry</th>
-                          <th className="px-3 py-1.5 text-right">Mark</th>
-                          <th className="px-3 py-1.5 text-right">PNL</th>
-                          <th className="px-4 py-1.5 text-center">Action</th>
+                          <th className="px-4 py-1.5">交易对</th>
+                          <th className="px-3 py-1.5 text-center">方向</th>
+                          <th className="px-3 py-1.5 text-right">数量</th>
+                          <th className="px-3 py-1.5 text-right">开仓价</th>
+                          <th className="px-3 py-1.5 text-right">现价</th>
+                          <th className="px-3 py-1.5 text-right">浮动盈亏</th>
+                          <th className="px-4 py-1.5 text-right">浮动比率</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-[var(--color-border)]/20">
                         {positions.map((p) => {
-                          const { currentPrice, pnl } = getPositionMetrics(p)
+                          const { currentPrice, pnl, floatingRatio } = getPositionMetrics(p)
                           const isPositive = pnl >= 0
+                          const isRatioPositive = floatingRatio >= 0
                           return (
                             <tr key={p.order_id || p.symbol} className="hover:bg-[var(--color-bg-hover)] transition-colors group">
                               <td className="px-4 py-1.5 font-black text-xs">{p.symbol}</td>
                               <td className="px-3 py-1.5 text-center">
-                                <span className={`px-1 py-0.5 rounded text-[8px] font-black uppercase ${p.side === 'LONG' ? 'bg-[var(--color-long)]/10 text-[var(--color-long)]' : 'bg-[var(--color-short)]/10 text-[var(--color-short)]'}`}>{p.side}</span>
+                                <span className={`px-1 py-0.5 rounded text-[8px] font-black ${p.side === 'LONG' ? 'bg-[var(--color-long)]/10 text-[var(--color-long)]' : 'bg-[var(--color-short)]/10 text-[var(--color-short)]'}`}>{p.side === 'LONG' ? '多' : '空'}</span>
                               </td>
                               <td className="px-3 py-1.5 text-right font-[var(--font-mono)] text-xs">{p.quantity}</td>
                               <td className="px-3 py-1.5 text-right font-[var(--font-mono)] text-xs text-[var(--color-text-secondary)]">{p.entry_price.toFixed(2)}</td>
@@ -204,10 +208,13 @@ export function DashboardPage() {
                                 <FlashText value={currentPrice}>{currentPrice.toFixed(2)}</FlashText>
                               </td>
                               <td className={`px-3 py-1.5 text-right font-[var(--font-mono)] text-xs font-black ${isPositive ? 'text-[var(--color-long)]' : 'text-[var(--color-short)]'}`}>
-                                <FlashText value={pnl}>{isPositive ? '+' : ''}{pnl.toFixed(2)}</FlashText>
+                                <div className="flex items-center justify-end gap-2">
+                                  <FlashText value={pnl}>{isPositive ? '+' : ''}{pnl.toFixed(2)}</FlashText>
+                                  {p.order_id && <button onClick={() => handleClose(p.order_id)} className="text-[9px] font-black text-[var(--color-short)] hover:underline opacity-0 group-hover:opacity-100 transition-opacity">平仓</button>}
+                                </div>
                               </td>
-                              <td className="px-4 py-1.5 text-center">
-                                {p.order_id && <button onClick={() => handleClose(p.order_id)} className="text-[9px] font-black text-[var(--color-short)] hover:underline uppercase opacity-0 group-hover:opacity-100 transition-opacity">Close</button>}
+                              <td className={`px-4 py-1.5 text-right font-[var(--font-mono)] text-xs font-black ${isRatioPositive ? 'text-[var(--color-long)]' : 'text-[var(--color-short)]'}`}>
+                                <FlashText value={floatingRatio}>{isRatioPositive ? '+' : ''}{floatingRatio.toFixed(2)}%</FlashText>
                               </td>
                             </tr>
                           )

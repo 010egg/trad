@@ -10,10 +10,12 @@ export function LoginPage() {
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const login = useAuthStore((state) => state.login)
+  const loading = useAuthStore((state) => state.loading)
   const navigate = useNavigate()
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (loading) return
     setError('')
     try {
       await login(email, password)
@@ -29,6 +31,10 @@ export function LoginPage() {
         const detail = error.response?.data?.detail
         if (typeof detail === 'string' && detail.trim()) {
           setError(detail)
+          return
+        }
+        if (error.code === 'ECONNABORTED') {
+          setError('登录请求超时，请检查后端是否正常运行')
           return
         }
         if (!error.response) {
@@ -53,15 +59,15 @@ export function LoginPage() {
         <form onSubmit={handleSubmit}>
           <div className="mb-4">
             <label className="block text-sm text-[var(--color-text-secondary)] mb-1">邮箱</label>
-            <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="your@email.com" />
+            <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="your@email.com" disabled={loading} />
           </div>
           <div className="mb-4">
             <label className="block text-sm text-[var(--color-text-secondary)] mb-1">密码</label>
-            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="输入密码" />
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="输入密码" disabled={loading} />
           </div>
           {error && <p className="text-sm text-[var(--color-danger)] mb-4">{error}</p>}
-          <button type="submit" className="w-full py-3 bg-[var(--color-accent)] text-white rounded font-medium text-base hover:opacity-90 transition cursor-pointer">
-            登 录
+          <button type="submit" disabled={loading} className="w-full py-3 bg-[var(--color-accent)] text-white rounded font-medium text-base hover:opacity-90 transition cursor-pointer disabled:cursor-not-allowed disabled:opacity-60">
+            {loading ? '登录中...' : '登 录'}
           </button>
         </form>
         <p className="text-center mt-6 text-sm text-[var(--color-text-secondary)]">
