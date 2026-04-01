@@ -4,6 +4,17 @@ import { MARKET_KLINE_LIMIT, useMarketStore } from '@/stores/useMarketStore'
 import { useBacktestSignalStore } from '@/stores/useBacktestSignalStore'
 import api from '@/lib/api'
 
+interface TooltipData {
+  time: string
+  open: number
+  high: number
+  low: number
+  close: number
+  change: number
+  changePct: number
+  amplitude: number
+}
+
 export interface IndicatorConfig {
   type: string
   period?: number
@@ -64,6 +75,8 @@ export function KlineChart({ indicators = [] }: KlineChartProps) {
   const signals = useBacktestSignalStore((state) => state.signals)
   const recordName = useBacktestSignalStore((state) => state.recordName)
 
+  const [tooltip, setTooltip] = useState<TooltipData | null>(null)
+
   const indicatorRequestRef = useRef(0)
   const indicatorKey = JSON.stringify(indicators)
 
@@ -74,7 +87,7 @@ export function KlineChart({ indicators = [] }: KlineChartProps) {
     const chart = createChart(chartRef.current, {
       layout: { background: { color: '#0d1117' }, textColor: '#8b949e', fontSize: 11 },
       grid: { vertLines: { color: '#21262d' }, horzLines: { color: '#21262d' } },
-      crosshair: { mode: 0 },
+      crosshair: { mode: 0, horzLine: { visible: false, labelVisible: false } },
       timeScale: { borderColor: '#30363d', timeVisible: true },
       rightPriceScale: { borderColor: '#30363d' },
       width: chartRef.current.clientWidth,
@@ -93,7 +106,38 @@ export function KlineChart({ indicators = [] }: KlineChartProps) {
       priceFormat: { type: 'volume' },
       priceScaleId: 'volume',
     })
-    chart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } })
+    chart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.85, bottom: 0 }, visible: false })
+
+    chart.subscribeCrosshairMove((param) => {
+      if (!param.time || !param.seriesData || !candleRef.current) {
+        setTooltip(null)
+        return
+      }
+      const bar = param.seriesData.get(candleRef.current) as {
+        open: number; high: number; low: number; close: number
+      } | undefined
+      if (!bar) { setTooltip(null); return }
+
+      const timeVal = param.time as number
+      const date = new Date(timeVal * 1000)
+      const pad = (n: number) => String(n).padStart(2, '0')
+      const timeStr = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+
+      const change = bar.close - bar.open
+      const changePct = bar.open !== 0 ? (change / bar.open) * 100 : 0
+      const amplitude = bar.open !== 0 ? ((bar.high - bar.low) / bar.open) * 100 : 0
+
+      setTooltip({
+        time: timeStr,
+        open: bar.open,
+        high: bar.high,
+        low: bar.low,
+        close: bar.close,
+        change,
+        changePct,
+        amplitude,
+      })
+    })
 
     const observer = new ResizeObserver((entries) => {
       if (!entries.length) return
@@ -173,7 +217,6 @@ export function KlineChart({ indicators = [] }: KlineChartProps) {
   useEffect(() => {
     if (!chartReady || !candleRef.current || !volumeRef.current) return
 
-    // 订阅 Zustand Store 中的 latestKline 变化
     const unsubscribe = useMarketStore.subscribe(
       (state) => state.latestKline,
       (latest) => {
@@ -296,6 +339,9 @@ export function KlineChart({ indicators = [] }: KlineChartProps) {
     candleRef.current.setMarkers(allMarkers)
   }, [chartReady, signals])
 
+  const isUp = tooltip ? tooltip.close >= tooltip.open : true
+  const changeColor = isUp ? '#3fb68b' : '#ff6838'
+
   return (
     <div className="w-full h-full flex flex-col min-h-0 overflow-hidden">
       {recordName && (
@@ -307,7 +353,23 @@ export function KlineChart({ indicators = [] }: KlineChartProps) {
           </span>
         </div>
       )}
-      <div ref={chartRef} className="w-full flex-1 min-h-0" />
+      <div className="relative w-full flex-1 min-h-0">
+        <div ref={chartRef} className="w-full h-full" />
+        {tooltip && (
+          <div className="absolute top-2 left-2 z-10 pointer-events-none select-none flex items-center gap-3 px-2 py-1 rounded text-[11px] font-mono"
+            style={{ background: 'rgba(13,17,23,0.85)', border: '1px solid #30363d' }}>
+            <span className="text-[#8b949e]">{tooltip.time}</span>
+            <span className="text-[#8b949e]">O <span style={{ color: changeColor }}>{tooltip.open.toFixed(2)}</span></span>
+            <span className="text-[#8b949e]">H <span className="text-[#3fb68b]">{tooltip.high.toFixed(2)}</span></span>
+            <span className="text-[#8b949e]">L <span className="text-[#ff6838]">{tooltip.low.toFixed(2)}</span></span>
+            <span className="text-[#8b949e]">C <span style={{ color: changeColor }}>{tooltip.close.toFixed(2)}</span></span>
+            <span style={{ color: changeColor }}>
+              {tooltip.change >= 0 ? '+' : ''}{tooltip.change.toFixed(2)} ({tooltip.changePct >= 0 ? '+' : ''}{tooltip.changePct.toFixed(2)}%)
+            </span>
+            <span className="text-[#8b949e]">振幅 <span className="text-white">{tooltip.amplitude.toFixed(2)}%</span></span>
+          </div>
+        )}
+      </div>
       {hasSubIndicators && (
         <div ref={subChartRef} className="w-full shrink-0 border-t border-[var(--color-border)]" style={{ height: 150 }} />
       )}

@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     openai_base_url: str | None = None
     openai_model: str | None = "minimax"
 
+    # FRED 宏观数据
+    fred_api_key: str | None = None
+
     model_config = {"env_file": ".env"}
 
 

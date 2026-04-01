@@ -26,6 +26,15 @@ from app.modules.market.service import SUPPORTED_SYMBOLS
 PROXY = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
 BINANCE_ANNOUNCEMENTS_URL = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
 COINTELEGRAPH_RSS_URL = "https://cointelegraph.com/rss"
+FRED_BASE_URL = "https://api.stlouisfed.org/fred"
+
+FRED_SERIES = [
+    {"id": "DFF", "name": "联邦基金利率", "unit": "%"},
+    {"id": "CPIAUCSL", "name": "CPI通胀指数", "unit": "点"},
+    {"id": "UNRATE", "name": "美国失业率", "unit": "%"},
+    {"id": "DGS10", "name": "10年期美债收益率", "unit": "%"},
+    {"id": "M2SL", "name": "M2货币供应量", "unit": "十亿美元"},
+]
 INTEL_REFRESH_TTL = timedelta(minutes=5)
 INTEL_REFRESH_WAIT_SECONDS = 2.0
 INTEL_ENRICH_CONCURRENCY = 4
@@ -561,10 +570,79 @@ async def fetch_cointelegraph_items(limit: int = 12) -> list[dict[str, Any]]:
     return items
 
 
+async def fetch_fred_items() -> list[dict[str, Any]]:
+    """从 FRED 获取关键宏观经济指标，写入情报 feed。"""
+    api_key = settings.fred_api_key
+    if not api_key:
+        return []
+
+    items: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, proxy=PROXY) as client:
+        for series in FRED_SERIES:
+            try:
+                resp = await client.get(
+                    f"{FRED_BASE_URL}/series/observations",
+                    params={
+                        "series_id": series["id"],
+                        "api_key": api_key,
+                        "file_type": "json",
+                        "limit": 2,
+                        "sort_order": "desc",
+                    },
+                )
+                resp.raise_for_status()
+                observations = resp.json().get("observations", [])
+                if not observations:
+                    continue
+
+                latest = observations[0]
+                raw_value = latest.get("value", ".")
+                if raw_value == ".":
+                    continue
+
+                value = float(raw_value)
+                date = latest.get("date", "")
+
+                change_text = ""
+                if len(observations) > 1:
+                    prev_raw = observations[1].get("value", ".")
+                    if prev_raw != ".":
+                        prev_value = float(prev_raw)
+                        diff = value - prev_value
+                        if abs(diff) > 0.001:
+                            change_text = f"，较上期 {'+' if diff > 0 else ''}{diff:.2f}{series['unit']}"
+                        else:
+                            change_text = "，与上期持平"
+
+                title = f"【宏观】{series['name']}：{value:.2f}{series['unit']}{change_text}（{date}）"
+                content = (
+                    f"FRED 数据更新：{series['name']}（{series['id']}）"
+                    f"最新值 {value:.2f}{series['unit']}，数据日期 {date}。"
+                    f"{change_text.lstrip('，') if change_text else ''}"
+                )
+                items.append(
+                    {
+                        "source_type": "external",
+                        "source_name": "FRED",
+                        "source_item_id": f"{series['id']}_{date}",
+                        "title": title,
+                        "source_url": f"https://fred.stlouisfed.org/series/{series['id']}",
+                        "content_raw": content,
+                        "published_at": _parse_published_at(f"{date}T00:00:00"),
+                        "category": "macro",
+                    }
+                )
+            except Exception as exc:
+                print(f"[Intel] FRED fetch failed for {series['id']}: {exc}")
+
+    return items
+
+
 async def fetch_external_intel_items() -> list[dict[str, Any]]:
     feeds = await asyncio.gather(
         fetch_binance_announcements(),
         fetch_cointelegraph_items(),
+        fetch_fred_items(),
         return_exceptions=True,
     )
 
