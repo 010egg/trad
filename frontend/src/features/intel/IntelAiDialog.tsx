@@ -1,18 +1,21 @@
 import { startTransition, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { API_BASE_URL, buildApiHeaders, handleApiUnauthorized } from '@/lib/api'
 import { useIntelAiStore } from '@/stores/useIntelAiStore'
 
 type IntelAiMessage = {
   role: 'user' | 'assistant'
   content: string
+  latency_ms?: number
 }
 
 type IntelAiSessions = Record<string, IntelAiMessage[]>
 
 type IntelAiStreamEvent =
   | { type: 'delta'; content: string }
-  | { type: 'done'; reply: string; model: string; latency_ms: number }
+  | { type: 'done'; reply: string; model: string; latency_ms: number; truncated?: boolean }
   | { type: 'error'; detail: string }
 
 const GLOBAL_SESSION_KEY = '__global__'
@@ -30,6 +33,11 @@ const GLOBAL_QUICK_PROMPTS = [
   '给我一个当前风险清单',
   '现在更适合防守还是进攻？',
 ]
+
+function formatLatency(latencyMs: number) {
+  if (latencyMs < 1000) return `${latencyMs}ms`
+  return `${(latencyMs / 1000).toFixed(1)}s`
+}
 
 function parseIntelAiStreamEvent(rawEvent: string): IntelAiStreamEvent | null {
   let eventType = 'message'
@@ -58,6 +66,7 @@ function parseIntelAiStreamEvent(rawEvent: string): IntelAiStreamEvent | null {
       reply: String(payload.reply || ''),
       model: String(payload.model || ''),
       latency_ms: Number(payload.latency_ms || 0),
+      truncated: Boolean(payload.truncated),
     }
   }
   if (eventType === 'error') {
@@ -154,52 +163,135 @@ async function streamIntelAiReply(
   }
 }
 
-function renderContent(content: string) {
-  const lines = content.replace(/\r\n/g, '\n').split('\n')
-  return lines.map((line, i) => {
-    const trimmed = line.trim()
-    if (!trimmed) return null
-
-    if (trimmed.startsWith('#') || (trimmed.startsWith('【') && trimmed.endsWith('】'))) {
-      const text = trimmed.replace(/^#+\s+/, '').replace(/[【】]/g, '')
-      return (
-        <h4 key={i} className="mt-3 mb-1.5 text-[10px] font-black uppercase tracking-[0.2em] text-blue-400 flex items-center gap-2">
-          <span className="w-3 h-px bg-blue-500/60" />
-          {text}
-        </h4>
-      )
-    }
-
-    if (/^([-*•]\s+|\d+[.)]\s+)/.test(trimmed)) {
-      const text = trimmed.replace(/^([-*•]\s+|\d+[.)]\s+)/, '')
-      return (
-        <div key={i} className="flex gap-2 py-0.5 text-[12px] leading-5 text-[#bbb]">
-          <span className="text-[#555] font-[var(--font-mono)] shrink-0">—</span>
-          <span>{processBold(text)}</span>
-        </div>
-      )
-    }
-
-    return (
-      <p key={i} className="mb-1.5 text-[12px] leading-[1.7] text-[#999] last:mb-0">
-        {processBold(trimmed)}
-      </p>
-    )
-  })
-}
-
-function processBold(text: string) {
-  const parts = text.split(/(\*\*.*?\*\*)/g)
-  return parts.map((part, i) => {
-    if (part.startsWith('**') && part.endsWith('**')) {
-      return (
-        <strong key={i} className="font-black text-white">
-          {part.slice(2, -2)}
-        </strong>
-      )
-    }
-    return part
-  })
+function MarkdownContent({ content }: { content: string }) {
+  return (
+    <div className="space-y-2">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          h1: ({ children }) => (
+            <h4 className="mt-3 mb-1.5 flex items-center gap-2 text-[10px] font-black uppercase tracking-[0.2em] text-blue-400 first:mt-0">
+              <span className="h-px w-3 bg-blue-500/60" />
+              <span>{children}</span>
+            </h4>
+          ),
+          h2: ({ children }) => (
+            <h4 className="mt-3 mb-1.5 flex items-center gap-2 text-[10px] font-black uppercase tracking-[0.2em] text-blue-400 first:mt-0">
+              <span className="h-px w-3 bg-blue-500/60" />
+              <span>{children}</span>
+            </h4>
+          ),
+          h3: ({ children }) => (
+            <h4 className="mt-3 mb-1.5 flex items-center gap-2 text-[10px] font-black uppercase tracking-[0.2em] text-blue-400 first:mt-0">
+              <span className="h-px w-3 bg-blue-500/60" />
+              <span>{children}</span>
+            </h4>
+          ),
+          p: ({ children }) => (
+            <p className="mb-1.5 text-[12px] leading-[1.7] text-[#999] last:mb-0">
+              {children}
+            </p>
+          ),
+          ul: ({ children }) => (
+            <ul className="mb-1.5 list-disc space-y-1 pl-4 text-[12px] leading-5 text-[#bbb] marker:text-blue-400/65 last:mb-0">
+              {children}
+            </ul>
+          ),
+          ol: ({ children }) => (
+            <ol className="mb-1.5 list-decimal space-y-1 pl-4 text-[12px] leading-5 text-[#bbb] marker:text-blue-400/65 last:mb-0">
+              {children}
+            </ol>
+          ),
+          li: ({ children, className }) => (
+            <li
+              className={`${className || ''} pl-0.5 [&>p]:mb-0 [&>p]:text-[12px] [&>p]:leading-5 [&>ul]:mb-0 [&>ul]:mt-1.5 [&>ol]:mb-0 [&>ol]:mt-1.5`}
+            >
+              {children}
+            </li>
+          ),
+          input: () => null,
+          strong: ({ children }) => (
+            <strong className="font-black text-white">{children}</strong>
+          ),
+          em: ({ children }) => (
+            <em className="text-[#c7d4e0] not-italic">{children}</em>
+          ),
+          blockquote: ({ children }) => (
+            <blockquote className="my-2 border-l border-blue-400/22 pl-3 text-[12px] leading-[1.7] text-[#8ea3bb]">
+              {children}
+            </blockquote>
+          ),
+          table: ({ children }) => (
+            <div className="my-2 overflow-x-auto rounded-[12px] border border-white/8 bg-[#0b0f14]">
+              <table className="min-w-full border-collapse text-left text-[11px] leading-5 text-[#b9c6d3]">
+                {children}
+              </table>
+            </div>
+          ),
+          thead: ({ children }) => (
+            <thead className="bg-white/[0.04] text-[#dce8f4]">
+              {children}
+            </thead>
+          ),
+          tbody: ({ children }) => (
+            <tbody className="[&_tr:last-child]:border-b-0">
+              {children}
+            </tbody>
+          ),
+          tr: ({ children }) => (
+            <tr className="border-b border-white/7 align-top">
+              {children}
+            </tr>
+          ),
+          th: ({ children }) => (
+            <th className="px-3 py-2 font-semibold tracking-[0.01em] text-[#edf5ff]">
+              {children}
+            </th>
+          ),
+          td: ({ children }) => (
+            <td className="px-3 py-2 text-[#9fb0c0] align-top break-words">
+              {children}
+            </td>
+          ),
+          hr: () => <hr className="my-3 border-0 border-t border-white/7" />,
+          code: ({ children, className, ...props }) => {
+            const isBlock = Boolean(className)
+            if (isBlock) {
+              return (
+                <code
+                  {...props}
+                  className={`${className} block overflow-x-auto rounded-[12px] bg-[#08111b] px-3 py-2 text-[11px] leading-5 text-[#d8e6f5]`}
+                >
+                  {children}
+                </code>
+              )
+            }
+            return (
+              <code
+                {...props}
+                className="rounded bg-white/6 px-1.5 py-0.5 text-[11px] text-[#d8e6f5]"
+              >
+                {children}
+              </code>
+            )
+          },
+          pre: ({ children }) => <pre className="my-2 overflow-x-auto">{children}</pre>,
+          a: ({ children, href }) => (
+            <a
+              href={href}
+              target="_blank"
+              rel="noreferrer"
+              className="text-blue-300 underline decoration-blue-400/35 underline-offset-2 hover:text-blue-200"
+            >
+              {children}
+            </a>
+          ),
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  )
 }
 
 function signalTone(signal: string) {
@@ -264,7 +356,7 @@ export function IntelAiDialog() {
   const askAi = async (question: string, silent = false) => {
     if (!question.trim() || loading) return
     const trimmedQuestion = question.trim()
-    const existing = sessions[sessionKey] || []
+    const existing = (sessions[sessionKey] || []).map(({ role, content }) => ({ role, content }))
     const nextMessages = silent
       ? [...existing, { role: 'assistant' as const, content: '' }]
       : [...existing, { role: 'user' as const, content: trimmedQuestion }, { role: 'assistant' as const, content: '' }]
@@ -323,7 +415,10 @@ export function IntelAiDialog() {
 
                 nextSession[nextSession.length - 1] = {
                   ...lastMessage,
-                  content: event.reply || lastMessage.content,
+                  content: event.truncated
+                    ? `${event.reply || lastMessage.content}\n\n[回答达到长度上限，可能被截断。可继续发送“继续”。]`
+                    : (event.reply || lastMessage.content),
+                  latency_ms: event.latency_ms,
                 }
                 return { ...prev, [sessionKey]: nextSession }
               })
@@ -472,101 +567,65 @@ export function IntelAiDialog() {
                 </div>
               </div>
             ) : messages.length === 0 && loading ? (
-              <div className="flex justify-start">
-                <div className="relative max-w-[88%] overflow-hidden rounded-[22px] border border-blue-500/18 bg-[linear-gradient(160deg,rgba(14,24,40,0.96),rgba(7,11,18,0.98))] px-4 py-3 shadow-[0_18px_46px_rgba(0,0,0,0.32)]">
-                  <span className="absolute inset-x-0 top-0 h-px bg-[linear-gradient(90deg,transparent,rgba(96,165,250,0.7),transparent)]" />
-                  <div className="mb-2 flex items-center gap-2">
-                    <span className="inline-flex h-6 items-center rounded-full border border-blue-400/20 bg-blue-400/10 px-2.5 text-[9px] font-black uppercase tracking-[0.2em] text-blue-300 font-[var(--font-mono)]">
-                      INTEL STREAM
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2 text-[10px] font-[var(--font-mono)] uppercase tracking-[0.18em] text-[#7d92a8]">
-                    <span className="inline-flex gap-0.5">
-                      <span className="h-1 w-1 rounded-full bg-blue-400/80 animate-bounce" style={{ animationDelay: '0ms' }} />
-                      <span className="h-1 w-1 rounded-full bg-cyan-300/80 animate-bounce" style={{ animationDelay: '140ms' }} />
-                      <span className="h-1 w-1 rounded-full bg-blue-200/80 animate-bounce" style={{ animationDelay: '280ms' }} />
-                    </span>
-                    正在推演市场影响...
-                  </div>
+              <div className="border-l-2 border-blue-500/40 pl-3 py-1">
+                <div className="flex items-center gap-2 text-[10px] font-[var(--font-mono)] uppercase tracking-[0.18em] text-[#555]">
+                  <span className="inline-flex gap-0.5">
+                    <span className="h-1 w-1 rounded-full bg-blue-400/80 animate-bounce" style={{ animationDelay: '0ms' }} />
+                    <span className="h-1 w-1 rounded-full bg-cyan-300/80 animate-bounce" style={{ animationDelay: '140ms' }} />
+                    <span className="h-1 w-1 rounded-full bg-blue-200/80 animate-bounce" style={{ animationDelay: '280ms' }} />
+                  </span>
+                  正在分析...
                 </div>
               </div>
             ) : (
               <>
                 {messages.map((message, index) => (
                   <div key={`${message.role}-${index}`} className={`flex ${message.role === 'assistant' ? 'justify-start' : 'justify-end'}`}>
-                    <div className={`relative max-w-[88%] ${message.role === 'assistant' ? '' : 'w-fit min-w-[58%]'}`}>
-                      <div className={`mb-1.5 flex items-center gap-2 ${message.role === 'assistant' ? '' : 'justify-end'}`}>
-                        {message.role === 'assistant' ? (
-                          <>
-                            <span className="inline-flex h-6 items-center rounded-full border border-blue-400/20 bg-blue-400/10 px-2.5 text-[9px] font-black uppercase tracking-[0.2em] text-blue-300 font-[var(--font-mono)]">
-                              INTEL
+                    <div className={message.role === 'assistant' ? 'max-w-[88%]' : 'max-w-[78%]'}>
+                      {message.role === 'assistant' ? (
+                        <>
+                          <div className="mb-1.5 flex items-center gap-2">
+                            <span className="text-[9px] font-black font-[var(--font-mono)] uppercase tracking-[0.18em] text-blue-400">
+                              AI
                             </span>
-                            <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-[#4f6378] font-[var(--font-mono)]">
-                              Analysis
-                            </span>
-                          </>
-                        ) : (
-                          <>
-                            <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-[#5f5f5f] font-[var(--font-mono)]">
-                              Manual Input
-                            </span>
-                            <span className="inline-flex h-6 items-center rounded-full border border-white/10 bg-white/[0.06] px-2.5 text-[9px] font-black uppercase tracking-[0.2em] text-white font-[var(--font-mono)]">
+                            {typeof message.latency_ms === 'number' && (
+                              <span className="text-[9px] font-bold font-[var(--font-mono)] text-[#555]">
+                                {formatLatency(message.latency_ms)}
+                              </span>
+                            )}
+                          </div>
+                          <div className="border-l-2 border-blue-500/50 pl-3 py-0.5">
+                            <div className="flow-root">
+                              <MarkdownContent content={message.content} />
+                            </div>
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <div className="mb-1.5 flex justify-end">
+                            <span className="text-[9px] font-black font-[var(--font-mono)] uppercase tracking-[0.18em] text-[#666]">
                               YOU
                             </span>
-                          </>
-                        )}
-                      </div>
-
-                      <div
-                        className={`relative overflow-hidden rounded-[22px] border px-4 py-3 shadow-[0_18px_46px_rgba(0,0,0,0.28)] ${
-                          message.role === 'assistant'
-                            ? 'border-blue-500/18 bg-[linear-gradient(160deg,rgba(14,24,40,0.96),rgba(7,11,18,0.98))]'
-                            : 'border-[#3b3b3b] bg-[linear-gradient(160deg,rgba(26,26,26,0.98),rgba(10,10,10,0.98))]'
-                        }`}
-                      >
-                        <span
-                          className={`absolute inset-x-0 top-0 h-px ${
-                            message.role === 'assistant'
-                              ? 'bg-[linear-gradient(90deg,transparent,rgba(96,165,250,0.7),transparent)]'
-                              : 'bg-[linear-gradient(90deg,transparent,rgba(255,255,255,0.34),transparent)]'
-                          }`}
-                        />
-                        <span
-                          className={`pointer-events-none absolute inset-y-3 ${message.role === 'assistant' ? 'left-0 w-px bg-[linear-gradient(180deg,transparent,rgba(59,130,246,0.72),transparent)]' : 'right-0 w-px bg-[linear-gradient(180deg,transparent,rgba(255,255,255,0.18),transparent)]'}`}
-                        />
-
-                        {message.role === 'assistant' ? (
-                          <div className="flow-root">{renderContent(message.content)}</div>
-                        ) : (
-                          <div className="space-y-2">
-                            <div className="text-[10px] font-black uppercase tracking-[0.18em] text-[#767676] font-[var(--font-mono)]">
-                              &gt; query
-                            </div>
-                            <p className="text-[12px] font-semibold text-white leading-relaxed whitespace-pre-wrap tracking-[0.01em]">
+                          </div>
+                          <div className="rounded-[14px] border border-[#2c2c2c] bg-[#111] px-3.5 py-2.5">
+                            <p className="text-[12px] font-medium text-[#f3f3f3] leading-relaxed whitespace-pre-wrap tracking-[0.01em]">
                               {message.content}
                             </p>
                           </div>
-                        )}
-                      </div>
+                        </>
+                      )}
                     </div>
                   </div>
                 ))}
 
                 {loading && messages.length > 0 && (
-                  <div className="flex justify-start">
-                    <div className="relative max-w-[88%] overflow-hidden rounded-[22px] border border-blue-500/14 bg-[linear-gradient(160deg,rgba(13,21,36,0.9),rgba(7,11,18,0.96))] px-4 py-3 shadow-[0_16px_34px_rgba(0,0,0,0.2)]">
-                      <span className="absolute inset-x-0 top-0 h-px bg-[linear-gradient(90deg,transparent,rgba(96,165,250,0.52),transparent)]" />
-                      <div className="flex items-center gap-2 text-[9px] font-[var(--font-mono)] uppercase tracking-[0.18em] text-[#6f87a0]">
-                        <span className="inline-flex h-5 items-center rounded-full border border-blue-400/15 bg-blue-400/8 px-2 text-[8px] font-black tracking-[0.2em] text-blue-300">
-                          LIVE
-                        </span>
-                        <span className="inline-flex gap-0.5">
-                          <span className="h-1 w-1 rounded-full bg-blue-400/80 animate-bounce" style={{ animationDelay: '0ms' }} />
-                          <span className="h-1 w-1 rounded-full bg-cyan-300/80 animate-bounce" style={{ animationDelay: '140ms' }} />
-                          <span className="h-1 w-1 rounded-full bg-blue-200/80 animate-bounce" style={{ animationDelay: '280ms' }} />
-                        </span>
-                        正在继续分析
-                      </div>
+                  <div className="border-l-2 border-blue-500/30 pl-3 py-1">
+                    <div className="flex items-center gap-1.5 text-[9px] font-[var(--font-mono)] text-[#555] uppercase tracking-widest">
+                      <span className="inline-flex gap-0.5">
+                        <span className="h-1 w-1 rounded-full bg-blue-400/80 animate-bounce" style={{ animationDelay: '0ms' }} />
+                        <span className="h-1 w-1 rounded-full bg-cyan-300/80 animate-bounce" style={{ animationDelay: '140ms' }} />
+                        <span className="h-1 w-1 rounded-full bg-blue-200/80 animate-bounce" style={{ animationDelay: '280ms' }} />
+                      </span>
                     </div>
                   </div>
                 )}

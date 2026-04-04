@@ -721,6 +721,61 @@ async def test_fetch_fred_items_preserves_observation_date(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_fetch_rss_items_parses_generic_feed(monkeypatch):
+    from app.modules.intel import service
+
+    payload = """<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0">
+      <channel>
+        <item>
+          <title>Judge continues Nevada ban on Kalshi sports markets</title>
+          <link>https://example.com/post-1</link>
+          <guid>post-1</guid>
+          <description><![CDATA[<p>Kalshi remains blocked in Nevada.</p>]]></description>
+          <pubDate>Sat, 04 Apr 2026 07:04:16 +0000</pubDate>
+        </item>
+      </channel>
+    </rss>
+    """
+
+    class FakeResponse:
+        text = payload
+
+        def raise_for_status(self):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            del exc_type, exc, tb
+            return False
+
+        async def get(self, url):
+            assert url == "https://example.com/feed.xml"
+            return FakeResponse()
+
+    monkeypatch.setattr(service.httpx, "AsyncClient", FakeAsyncClient)
+
+    items = await service.fetch_rss_items(
+        source_name="CoinDesk",
+        rss_url="https://example.com/feed.xml",
+        limit=5,
+    )
+
+    assert len(items) == 1
+    assert items[0]["source_name"] == "CoinDesk"
+    assert items[0]["source_item_id"] == "post-1"
+    assert items[0]["source_url"] == "https://example.com/post-1"
+    assert items[0]["content_raw"] == "Kalshi remains blocked in Nevada."
+    assert items[0]["published_at"] == datetime(2026, 4, 4, 7, 4, 16)
+
+
+@pytest.mark.asyncio
 async def test_upsert_intel_items_updates_source_item_id_when_matching_by_source_url(db_session):
     from app.modules.intel.models import IntelItem
     from app.modules.intel.service import upsert_intel_items
@@ -777,6 +832,88 @@ async def test_upsert_intel_items_updates_source_item_id_when_matching_by_source
     assert rows[0].source_item_id == "DGS10_2026-04-02"
     assert rows[0].published_at == datetime(2026, 4, 2, 0, 0, 0)
     assert rows[0].title == "新数据"
+
+
+@pytest.mark.asyncio
+async def test_query_intel_feed_orders_and_paginates_by_ingested_at(db_session):
+    from app.modules.intel.models import IntelItem
+    from app.modules.intel.service import query_intel_feed
+
+    db_session.add_all(
+        [
+            IntelItem(
+                id="intel-a",
+                source_type="external",
+                source_name="Cointelegraph",
+                source_item_id="ct-a",
+                title="Older publish, latest ingest",
+                source_url="https://example.com/a",
+                content_raw="A",
+                summary_ai="A",
+                signal="NEUTRAL",
+                confidence=0.5,
+                reasoning="A",
+                category="macro",
+                published_at=datetime(2026, 4, 1, 10, 0, 0),
+                ingested_at=datetime(2026, 4, 4, 12, 0, 0),
+                score=0.5,
+                source_score=0.5,
+                confirmation_count=1,
+                is_active=True,
+            ),
+            IntelItem(
+                id="intel-b",
+                source_type="external",
+                source_name="Cointelegraph",
+                source_item_id="ct-b",
+                title="Newer publish, earlier ingest",
+                source_url="https://example.com/b",
+                content_raw="B",
+                summary_ai="B",
+                signal="NEUTRAL",
+                confidence=0.5,
+                reasoning="B",
+                category="macro",
+                published_at=datetime(2026, 4, 3, 10, 0, 0),
+                ingested_at=datetime(2026, 4, 4, 11, 0, 0),
+                score=0.5,
+                source_score=0.5,
+                confirmation_count=1,
+                is_active=True,
+            ),
+            IntelItem(
+                id="intel-c",
+                source_type="external",
+                source_name="Cointelegraph",
+                source_item_id="ct-c",
+                title="Earliest ingest",
+                source_url="https://example.com/c",
+                content_raw="C",
+                summary_ai="C",
+                signal="NEUTRAL",
+                confidence=0.5,
+                reasoning="C",
+                category="macro",
+                published_at=datetime(2026, 4, 2, 10, 0, 0),
+                ingested_at=datetime(2026, 4, 4, 10, 0, 0),
+                score=0.5,
+                source_score=0.5,
+                confirmation_count=1,
+                is_active=True,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    first_page = await query_intel_feed(db_session, limit=2)
+
+    assert [item["id"] for item in first_page["items"]] == ["intel-a", "intel-b"]
+    assert first_page["next_cursor"] == "2026-04-04T11:00:00|intel-b"
+
+    second_page = await query_intel_feed(db_session, limit=2, cursor=first_page["next_cursor"])
+
+    assert [item["id"] for item in second_page["items"]] == ["intel-c"]
+    assert second_page["next_cursor"] is None
 
 
 @pytest.mark.asyncio

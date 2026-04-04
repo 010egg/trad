@@ -27,6 +27,9 @@ PROXY = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
 BINANCE_ANNOUNCEMENTS_URL = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
 BINANCE_ANNOUNCEMENTS_MAX_PAGE_SIZE = 5
 COINTELEGRAPH_RSS_URL = "https://cointelegraph.com/rss"
+COINDESK_RSS_URL = "https://www.coindesk.com/arc/outboundfeeds/rss/"
+DECRYPT_RSS_URL = "https://decrypt.co/feed"
+THEBLOCK_RSS_URL = "https://www.theblock.co/rss.xml"
 FRED_BASE_URL = "https://api.stlouisfed.org/fred"
 
 FRED_SERIES = [
@@ -39,6 +42,8 @@ FRED_SERIES = [
 INTEL_REFRESH_TTL = timedelta(minutes=5)
 INTEL_REFRESH_WAIT_SECONDS = 2.0
 INTEL_ENRICH_CONCURRENCY = 4
+INTEL_CHAT_MAX_TOKENS = 1200
+INTEL_CHAT_REPLY_CHAR_LIMIT = 4000
 
 SIGNAL_VALUES = {"BULLISH", "BEARISH", "NEUTRAL"}
 CATEGORY_VALUES = {"macro", "onchain", "exchange", "regulation", "project"}
@@ -509,6 +514,26 @@ def _extract_stream_error_message(payload: dict[str, Any]) -> str:
     return "流式响应失败"
 
 
+def _extract_openai_stream_finish_reason(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return ""
+    finish_reason = choices[0].get("finish_reason")
+    return str(finish_reason or "")
+
+
+def _extract_anthropic_stream_finish_reason(payload: dict[str, Any]) -> str:
+    if payload.get("type") != "message_delta":
+        return ""
+
+    delta = payload.get("delta") or {}
+    if isinstance(delta, dict) and delta.get("stop_reason"):
+        return str(delta["stop_reason"])
+    if payload.get("stop_reason"):
+        return str(payload["stop_reason"])
+    return ""
+
+
 async def _request_chat_completion_stream(
     runtime_config: dict[str, str],
     messages: list[dict[str, str]],
@@ -564,6 +589,10 @@ async def _request_chat_completion_stream(
                     if isinstance(message, dict) and message.get("model"):
                         yield {"type": "meta", "model": str(message["model"])}
 
+                    finish_reason = _extract_anthropic_stream_finish_reason(payload)
+                    if finish_reason:
+                        yield {"type": "finish", "reason": finish_reason}
+
                     text = _extract_anthropic_stream_text(payload)
                     if text:
                         yield {"type": "delta", "content": text}
@@ -601,6 +630,10 @@ async def _request_chat_completion_stream(
                 if payload.get("model"):
                     yield {"type": "meta", "model": str(payload["model"])}
 
+                finish_reason = _extract_openai_stream_finish_reason(payload)
+                if finish_reason:
+                    yield {"type": "finish", "reason": finish_reason}
+
                 text = _extract_openai_stream_text(payload)
                 if text:
                     yield {"type": "delta", "content": text}
@@ -617,6 +650,7 @@ async def _stream_chat_reply(
     model = str(runtime_config["model"])
     reply_parts: list[str] = []
     total_length = 0
+    finish_reason = ""
 
     async for event in _request_chat_completion_stream(
         runtime_config,
@@ -629,12 +663,15 @@ async def _stream_chat_reply(
             if next_model:
                 model = next_model
             continue
-
-        chunk = str(event.get("content") or "")
-        if not chunk or total_length >= 4000:
+        if event["type"] == "finish":
+            finish_reason = str(event.get("reason") or "").strip()
             continue
 
-        remaining = 4000 - total_length
+        chunk = str(event.get("content") or "")
+        if not chunk or total_length >= INTEL_CHAT_REPLY_CHAR_LIMIT:
+            continue
+
+        remaining = INTEL_CHAT_REPLY_CHAR_LIMIT - total_length
         clipped = chunk[:remaining]
         if not clipped:
             continue
@@ -647,12 +684,16 @@ async def _stream_chat_reply(
     if not reply:
         raise RuntimeError("AI 未返回有效内容")
 
-    yield {
+    truncated = finish_reason in {"length", "max_tokens"} or total_length >= INTEL_CHAT_REPLY_CHAR_LIMIT
+    payload = {
         "type": "done",
         "reply": reply,
         "model": model,
         "latency_ms": int((monotonic() - started_at) * 1000),
     }
+    if truncated:
+        payload["truncated"] = True
+    yield payload
 
 
 async def _request_chat_completion(
@@ -825,6 +866,8 @@ def _build_intel_chat_payload(item: IntelItem, question: str, history: list[dict
         "当前问题:\n"
         f"{question.strip()}\n\n"
         "请基于这条情报直接回答，重点说明影响逻辑、受影响标的、时间维度、风险点和后续观察信号。"
+        "默认使用简洁 Markdown 输出，使用标题、列表和加粗组织信息，不要输出 HTML。"
+        "观察清单请使用普通无序列表，不要使用任务列表复选框。"
     )
 
 
@@ -855,6 +898,8 @@ def _build_general_chat_payload(question: str, history: list[dict[str, str]]) ->
         "当前问题:\n"
         f"{question.strip()}\n\n"
         "请直接回答，优先给出结论、核心逻辑、风险点和后续观察信号。"
+        "默认使用简洁 Markdown 输出，使用标题、列表和加粗组织信息，不要输出 HTML。"
+        "观察清单请使用普通无序列表，不要使用任务列表复选框。"
     )
 
 
@@ -906,8 +951,22 @@ async def fetch_binance_announcements(limit: int = 8) -> list[dict[str, Any]]:
 
 
 async def fetch_cointelegraph_items(limit: int = 12) -> list[dict[str, Any]]:
+    return await fetch_rss_items(
+        source_name="Cointelegraph",
+        rss_url=COINTELEGRAPH_RSS_URL,
+        limit=limit,
+    )
+
+
+async def fetch_rss_items(
+    *,
+    source_name: str,
+    rss_url: str,
+    limit: int = 12,
+    category: str | None = None,
+) -> list[dict[str, Any]]:
     async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, proxy=PROXY) as client:
-        response = await client.get(COINTELEGRAPH_RSS_URL)
+        response = await client.get(rss_url)
         response.raise_for_status()
         payload = response.text
 
@@ -924,18 +983,43 @@ async def fetch_cointelegraph_items(limit: int = 12) -> list[dict[str, Any]]:
         description = _strip_html(entry.findtext("description") or "")
         if not title or not link:
             continue
-        items.append(
-            {
-                "source_type": "external",
-                "source_name": "Cointelegraph",
-                "source_item_id": guid,
-                "title": title,
-                "source_url": link,
-                "content_raw": description or title,
-                "published_at": _parse_published_at(entry.findtext("pubDate")),
-            }
-        )
+        item = {
+            "source_type": "external",
+            "source_name": source_name,
+            "source_item_id": guid,
+            "title": title,
+            "source_url": link,
+            "content_raw": description or title,
+            "published_at": _parse_published_at(entry.findtext("pubDate")),
+        }
+        if category:
+            item["category"] = category
+        items.append(item)
     return items
+
+
+async def fetch_coindesk_items(limit: int = 10) -> list[dict[str, Any]]:
+    return await fetch_rss_items(
+        source_name="CoinDesk",
+        rss_url=COINDESK_RSS_URL,
+        limit=limit,
+    )
+
+
+async def fetch_decrypt_items(limit: int = 10) -> list[dict[str, Any]]:
+    return await fetch_rss_items(
+        source_name="Decrypt",
+        rss_url=DECRYPT_RSS_URL,
+        limit=limit,
+    )
+
+
+async def fetch_theblock_items(limit: int = 8) -> list[dict[str, Any]]:
+    return await fetch_rss_items(
+        source_name="The Block",
+        rss_url=THEBLOCK_RSS_URL,
+        limit=limit,
+    )
 
 
 async def fetch_fred_items() -> list[dict[str, Any]]:
@@ -1010,6 +1094,9 @@ async def fetch_external_intel_items() -> list[dict[str, Any]]:
     feeds = await asyncio.gather(
         fetch_binance_announcements(),
         fetch_cointelegraph_items(),
+        fetch_coindesk_items(),
+        fetch_decrypt_items(),
+        fetch_theblock_items(),
         fetch_fred_items(),
         return_exceptions=True,
     )
@@ -1155,7 +1242,7 @@ async def chat_with_intel_item(
             runtime_config,
             _build_chat_messages(runtime_config, prompt),
             temperature=0.3,
-            max_tokens=700,
+            max_tokens=INTEL_CHAT_MAX_TOKENS,
         )
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text.strip()[:240] or str(exc)
@@ -1202,7 +1289,7 @@ async def chat_with_intel_assistant(
             runtime_config,
             _build_chat_messages(runtime_config, prompt),
             temperature=0.3,
-            max_tokens=700,
+            max_tokens=INTEL_CHAT_MAX_TOKENS,
         )
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text.strip()[:240] or str(exc)
@@ -1254,7 +1341,7 @@ async def stream_chat_with_intel_item(
         )
 
     prompt = _build_intel_chat_payload(item, question, history or [])
-    return _stream_chat_reply(runtime_config, prompt, temperature=0.3, max_tokens=700)
+    return _stream_chat_reply(runtime_config, prompt, temperature=0.3, max_tokens=INTEL_CHAT_MAX_TOKENS)
 
 
 async def stream_chat_with_intel_assistant(
@@ -1279,7 +1366,7 @@ async def stream_chat_with_intel_assistant(
         )
 
     prompt = _build_general_chat_payload(question, history or [])
-    return _stream_chat_reply(runtime_config, prompt, temperature=0.3, max_tokens=700)
+    return _stream_chat_reply(runtime_config, prompt, temperature=0.3, max_tokens=INTEL_CHAT_MAX_TOKENS)
 
 
 async def _find_existing_item(db: AsyncSession, payload: dict[str, Any]) -> IntelItem | None:
@@ -1572,14 +1659,14 @@ def _cursor_clause(cursor: str | None):
         return None
     if "|" not in cursor:
         return None
-    published_at_raw, item_id = cursor.split("|", 1)
+    ingested_at_raw, item_id = cursor.split("|", 1)
     try:
-        published_at = datetime.fromisoformat(published_at_raw)
+        ingested_at = datetime.fromisoformat(ingested_at_raw)
     except ValueError:
         return None
     return or_(
-        IntelItem.published_at < published_at,
-        and_(IntelItem.published_at == published_at, IntelItem.id < item_id),
+        IntelItem.ingested_at < ingested_at,
+        and_(IntelItem.ingested_at == ingested_at, IntelItem.id < item_id),
     )
 
 
@@ -1657,7 +1744,7 @@ async def query_intel_feed(
     stmt = (
         stmt
         .options(selectinload(IntelItem.symbol_links))
-        .order_by(IntelItem.published_at.desc(), IntelItem.id.desc())
+        .order_by(IntelItem.ingested_at.desc(), IntelItem.published_at.desc(), IntelItem.id.desc())
         .limit(limit + 1)
     )
 
@@ -1667,7 +1754,7 @@ async def query_intel_feed(
     next_cursor = None
     if has_more and items:
         tail = items[-1]
-        next_cursor = f"{tail.published_at.isoformat()}|{tail.id}"
+        next_cursor = f"{tail.ingested_at.isoformat()}|{tail.id}"
 
     return {
         "items": [serialize_intel_item(item) for item in items],
