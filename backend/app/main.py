@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -13,6 +15,28 @@ from app.modules.risk.router import router as risk_router
 from app.modules.trade.router import router as trade_router
 from app.ws.router import router as ws_router
 from app.ws.binance_ws import manager as ws_manager
+
+_logger = logging.getLogger("intel.auto_refresh")
+
+
+async def _intel_auto_refresh_loop() -> None:
+    from app.database import async_session
+    from app.modules.intel.service import INTEL_REFRESH_TTL, refresh_intel_feed
+
+    interval = INTEL_REFRESH_TTL.total_seconds()
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            async with async_session() as db:
+                result = await refresh_intel_feed(db, allow_env_fallback=True)
+                _logger.info(
+                    "Intel auto-refresh: fetched=%d created=%d updated=%d",
+                    result["fetched"], result["created"], result["updated"],
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _logger.warning("Intel auto-refresh failed: %s", exc)
 
 
 @asynccontextmanager
@@ -40,12 +64,17 @@ async def lifespan(app: FastAPI):
             ("trade_settings", "llm_model", "VARCHAR(120) NOT NULL DEFAULT 'minimax'"),
             ("trade_settings", "llm_system_prompt", "TEXT NOT NULL DEFAULT ''"),
             ("trade_settings", "llm_api_key_enc", "TEXT"),
+            ("intel_items", "source_score", "FLOAT NOT NULL DEFAULT 0.5"),
+            ("intel_items", "confirmation_count", "INTEGER NOT NULL DEFAULT 1"),
         ]:
             try:
                 await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {col} {definition}"))
             except Exception:
                 pass  # 列已存在，忽略
+    refresh_task = asyncio.create_task(_intel_auto_refresh_loop())
     yield
+    refresh_task.cancel()
+    await asyncio.gather(refresh_task, return_exceptions=True)
     await ws_manager.shutdown()
 
 

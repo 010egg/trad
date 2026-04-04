@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { startTransition, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
-import api from '@/lib/api'
+import { API_BASE_URL, buildApiHeaders, handleApiUnauthorized } from '@/lib/api'
 import { useIntelAiStore } from '@/stores/useIntelAiStore'
 
 type IntelAiMessage = {
@@ -10,11 +10,10 @@ type IntelAiMessage = {
 
 type IntelAiSessions = Record<string, IntelAiMessage[]>
 
-type IntelAiResponse = {
-  reply: string
-  model: string
-  latency_ms: number
-}
+type IntelAiStreamEvent =
+  | { type: 'delta'; content: string }
+  | { type: 'done'; reply: string; model: string; latency_ms: number }
+  | { type: 'error'; detail: string }
 
 const GLOBAL_SESSION_KEY = '__global__'
 
@@ -31,6 +30,129 @@ const GLOBAL_QUICK_PROMPTS = [
   '给我一个当前风险清单',
   '现在更适合防守还是进攻？',
 ]
+
+function parseIntelAiStreamEvent(rawEvent: string): IntelAiStreamEvent | null {
+  let eventType = 'message'
+  const dataLines: string[] = []
+
+  for (const line of rawEvent.split('\n')) {
+    if (!line || line.startsWith(':')) continue
+    if (line.startsWith('event:')) {
+      eventType = line.slice(6).trim() || 'message'
+      continue
+    }
+    if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trimStart())
+    }
+  }
+
+  if (dataLines.length === 0) return null
+
+  const payload = JSON.parse(dataLines.join('\n')) as Record<string, unknown>
+  if (eventType === 'delta') {
+    return { type: 'delta', content: String(payload.content || '') }
+  }
+  if (eventType === 'done') {
+    return {
+      type: 'done',
+      reply: String(payload.reply || ''),
+      model: String(payload.model || ''),
+      latency_ms: Number(payload.latency_ms || 0),
+    }
+  }
+  if (eventType === 'error') {
+    return { type: 'error', detail: String(payload.detail || 'AI 分析失败') }
+  }
+  return null
+}
+
+async function streamIntelAiReply(
+  path: string,
+  payload: { question: string; history: IntelAiMessage[] },
+  signal: AbortSignal,
+  onEvent: (event: IntelAiStreamEvent) => void,
+) {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method: 'POST',
+    headers: buildApiHeaders({
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+    }),
+    body: JSON.stringify(payload),
+    signal,
+  })
+
+  handleApiUnauthorized(response.status)
+  if (!response.ok) {
+    let detail = 'AI 分析失败'
+    try {
+      const body = await response.json()
+      detail = String(body?.detail || body?.message || detail)
+    } catch {
+      const text = await response.text()
+      if (text.trim()) {
+        detail = text.trim()
+      }
+    }
+    throw new Error(detail)
+  }
+
+  if (!response.body) {
+    throw new Error('当前环境不支持流式响应')
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let completed = false
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true }).replace(/\r/g, '')
+
+    let boundaryIndex = buffer.indexOf('\n\n')
+    while (boundaryIndex !== -1) {
+      const rawEvent = buffer.slice(0, boundaryIndex).trim()
+      buffer = buffer.slice(boundaryIndex + 2)
+
+      if (rawEvent) {
+        const event = parseIntelAiStreamEvent(rawEvent)
+        if (event) {
+          onEvent(event)
+          if (event.type === 'error') {
+            throw new Error(event.detail)
+          }
+          if (event.type === 'done') {
+            completed = true
+          }
+        }
+      }
+
+      boundaryIndex = buffer.indexOf('\n\n')
+    }
+  }
+
+  buffer += decoder.decode().replace(/\r/g, '')
+  const rawEvent = buffer.trim()
+  if (rawEvent) {
+    const event = parseIntelAiStreamEvent(rawEvent)
+    if (event) {
+      onEvent(event)
+      if (event.type === 'error') {
+        throw new Error(event.detail)
+      }
+      if (event.type === 'done') {
+        completed = true
+      }
+    }
+  }
+
+  if (!completed) {
+    throw new Error('AI 流式响应中断')
+  }
+}
 
 function renderContent(content: string) {
   const lines = content.replace(/\r\n/g, '\n').split('\n')
@@ -99,6 +221,7 @@ export function IntelAiDialog() {
   const [meta, setMeta] = useState<{ model: string; latency_ms: number } | null>(null)
   const bodyRef = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
   const sessionKey = item?.id || GLOBAL_SESSION_KEY
   const quickPrompts = item ? ITEM_QUICK_PROMPTS : GLOBAL_QUICK_PROMPTS
 
@@ -126,32 +249,111 @@ export function IntelAiDialog() {
     }
   }, [open])
 
+  useEffect(() => {
+    abortRef.current?.abort()
+    abortRef.current = null
+    setLoading(false)
+  }, [sessionKey])
+
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort()
+    }
+  }, [])
+
   const askAi = async (question: string, silent = false) => {
     if (!question.trim() || loading) return
+    const trimmedQuestion = question.trim()
     const existing = sessions[sessionKey] || []
-    const nextMessages = silent ? existing : [...existing, { role: 'user' as const, content: question.trim() }]
+    const nextMessages = silent
+      ? [...existing, { role: 'assistant' as const, content: '' }]
+      : [...existing, { role: 'user' as const, content: trimmedQuestion }, { role: 'assistant' as const, content: '' }]
 
-    if (!silent) {
+    abortRef.current?.abort()
+    const controller = new AbortController()
+    abortRef.current = controller
+
+    startTransition(() => {
       setSessions((prev) => ({ ...prev, [sessionKey]: nextMessages }))
-    }
+    })
 
     setLoading(true)
     setError('')
+    setMeta(null)
 
     try {
-      const data: IntelAiResponse = await api.post(item ? `/intel/${item.id}/chat` : '/intel/chat', {
-        question: question.trim(),
-        history: existing,
+      await streamIntelAiReply(
+        item ? `/intel/${item.id}/chat/stream` : '/intel/chat/stream',
+        {
+          question: trimmedQuestion,
+          history: existing,
+        },
+        controller.signal,
+        (event) => {
+          if (event.type === 'delta') {
+            startTransition(() => {
+              setSessions((prev) => {
+                const session = prev[sessionKey]
+                if (!session?.length) return prev
+
+                const nextSession = [...session]
+                const lastMessage = nextSession[nextSession.length - 1]
+                if (!lastMessage || lastMessage.role !== 'assistant') return prev
+
+                nextSession[nextSession.length - 1] = {
+                  ...lastMessage,
+                  content: `${lastMessage.content}${event.content}`,
+                }
+                return { ...prev, [sessionKey]: nextSession }
+              })
+            })
+            return
+          }
+
+          if (event.type === 'done') {
+            setMeta({ model: event.model, latency_ms: event.latency_ms })
+            startTransition(() => {
+              setSessions((prev) => {
+                const session = prev[sessionKey]
+                if (!session?.length) return prev
+
+                const nextSession = [...session]
+                const lastMessage = nextSession[nextSession.length - 1]
+                if (!lastMessage || lastMessage.role !== 'assistant') return prev
+
+                nextSession[nextSession.length - 1] = {
+                  ...lastMessage,
+                  content: event.reply || lastMessage.content,
+                }
+                return { ...prev, [sessionKey]: nextSession }
+              })
+            })
+          }
+        },
+      )
+    } catch (err: any) {
+      if (err?.name === 'AbortError') return
+
+      startTransition(() => {
+        setSessions((prev) => {
+          const session = prev[sessionKey]
+          if (!session?.length) return prev
+
+          const nextSession = [...session]
+          const lastMessage = nextSession[nextSession.length - 1]
+          if (lastMessage?.role === 'assistant' && !lastMessage.content.trim()) {
+            nextSession.pop()
+            return { ...prev, [sessionKey]: nextSession }
+          }
+          return prev
+        })
       })
 
-      setMeta({ model: data.model, latency_ms: data.latency_ms })
-      setSessions((prev) => ({
-        ...prev,
-        [sessionKey]: [...nextMessages, { role: 'assistant', content: data.reply }],
-      }))
-    } catch (err: any) {
       setError(err.response?.data?.detail || err.message || 'AI 分析失败')
     } finally {
+      if (abortRef.current === controller) {
+        abortRef.current = null
+      }
       setLoading(false)
     }
   }
@@ -270,46 +472,102 @@ export function IntelAiDialog() {
                 </div>
               </div>
             ) : messages.length === 0 && loading ? (
-              <div className="border-l-2 border-blue-500/40 pl-3 py-1">
-                <div className="text-[10px] font-[var(--font-mono)] uppercase tracking-[0.18em] text-[#555] flex items-center gap-2">
-                  <span className="inline-flex gap-0.5">
-                    <span className="w-1 h-1 bg-blue-500/60 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                    <span className="w-1 h-1 bg-blue-500/60 rounded-full animate-bounce" style={{ animationDelay: '140ms' }} />
-                    <span className="w-1 h-1 bg-blue-500/60 rounded-full animate-bounce" style={{ animationDelay: '280ms' }} />
-                  </span>
-                  正在分析...
+              <div className="flex justify-start">
+                <div className="relative max-w-[88%] overflow-hidden rounded-[22px] border border-blue-500/18 bg-[linear-gradient(160deg,rgba(14,24,40,0.96),rgba(7,11,18,0.98))] px-4 py-3 shadow-[0_18px_46px_rgba(0,0,0,0.32)]">
+                  <span className="absolute inset-x-0 top-0 h-px bg-[linear-gradient(90deg,transparent,rgba(96,165,250,0.7),transparent)]" />
+                  <div className="mb-2 flex items-center gap-2">
+                    <span className="inline-flex h-6 items-center rounded-full border border-blue-400/20 bg-blue-400/10 px-2.5 text-[9px] font-black uppercase tracking-[0.2em] text-blue-300 font-[var(--font-mono)]">
+                      INTEL STREAM
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2 text-[10px] font-[var(--font-mono)] uppercase tracking-[0.18em] text-[#7d92a8]">
+                    <span className="inline-flex gap-0.5">
+                      <span className="h-1 w-1 rounded-full bg-blue-400/80 animate-bounce" style={{ animationDelay: '0ms' }} />
+                      <span className="h-1 w-1 rounded-full bg-cyan-300/80 animate-bounce" style={{ animationDelay: '140ms' }} />
+                      <span className="h-1 w-1 rounded-full bg-blue-200/80 animate-bounce" style={{ animationDelay: '280ms' }} />
+                    </span>
+                    正在推演市场影响...
+                  </div>
                 </div>
               </div>
             ) : (
               <>
                 {messages.map((message, index) => (
-                  <div key={`${message.role}-${index}`} className={`${message.role === 'user' ? 'ml-4' : ''}`}>
-                    <div className="flex items-center gap-2 mb-1.5">
-                      <span className={`text-[9px] font-black font-[var(--font-mono)] uppercase tracking-[0.18em] ${message.role === 'assistant' ? 'text-blue-400' : 'text-[#555]'}`}>
-                        {message.role === 'assistant' ? 'INTEL' : 'YOU'}
-                      </span>
-                    </div>
-                    <div className={`border-l-2 pl-3 py-0.5 ${message.role === 'assistant' ? 'border-blue-500/50' : 'border-[#333]'}`}>
-                      {message.role === 'assistant' ? (
-                        <div className="flow-root">{renderContent(message.content)}</div>
-                      ) : (
-                        <p className="text-[12px] font-bold text-[#ddd] leading-relaxed whitespace-pre-wrap">
-                          {message.content}
-                        </p>
-                      )}
+                  <div key={`${message.role}-${index}`} className={`flex ${message.role === 'assistant' ? 'justify-start' : 'justify-end'}`}>
+                    <div className={`relative max-w-[88%] ${message.role === 'assistant' ? '' : 'w-fit min-w-[58%]'}`}>
+                      <div className={`mb-1.5 flex items-center gap-2 ${message.role === 'assistant' ? '' : 'justify-end'}`}>
+                        {message.role === 'assistant' ? (
+                          <>
+                            <span className="inline-flex h-6 items-center rounded-full border border-blue-400/20 bg-blue-400/10 px-2.5 text-[9px] font-black uppercase tracking-[0.2em] text-blue-300 font-[var(--font-mono)]">
+                              INTEL
+                            </span>
+                            <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-[#4f6378] font-[var(--font-mono)]">
+                              Analysis
+                            </span>
+                          </>
+                        ) : (
+                          <>
+                            <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-[#5f5f5f] font-[var(--font-mono)]">
+                              Manual Input
+                            </span>
+                            <span className="inline-flex h-6 items-center rounded-full border border-white/10 bg-white/[0.06] px-2.5 text-[9px] font-black uppercase tracking-[0.2em] text-white font-[var(--font-mono)]">
+                              YOU
+                            </span>
+                          </>
+                        )}
+                      </div>
+
+                      <div
+                        className={`relative overflow-hidden rounded-[22px] border px-4 py-3 shadow-[0_18px_46px_rgba(0,0,0,0.28)] ${
+                          message.role === 'assistant'
+                            ? 'border-blue-500/18 bg-[linear-gradient(160deg,rgba(14,24,40,0.96),rgba(7,11,18,0.98))]'
+                            : 'border-[#3b3b3b] bg-[linear-gradient(160deg,rgba(26,26,26,0.98),rgba(10,10,10,0.98))]'
+                        }`}
+                      >
+                        <span
+                          className={`absolute inset-x-0 top-0 h-px ${
+                            message.role === 'assistant'
+                              ? 'bg-[linear-gradient(90deg,transparent,rgba(96,165,250,0.7),transparent)]'
+                              : 'bg-[linear-gradient(90deg,transparent,rgba(255,255,255,0.34),transparent)]'
+                          }`}
+                        />
+                        <span
+                          className={`pointer-events-none absolute inset-y-3 ${message.role === 'assistant' ? 'left-0 w-px bg-[linear-gradient(180deg,transparent,rgba(59,130,246,0.72),transparent)]' : 'right-0 w-px bg-[linear-gradient(180deg,transparent,rgba(255,255,255,0.18),transparent)]'}`}
+                        />
+
+                        {message.role === 'assistant' ? (
+                          <div className="flow-root">{renderContent(message.content)}</div>
+                        ) : (
+                          <div className="space-y-2">
+                            <div className="text-[10px] font-black uppercase tracking-[0.18em] text-[#767676] font-[var(--font-mono)]">
+                              &gt; query
+                            </div>
+                            <p className="text-[12px] font-semibold text-white leading-relaxed whitespace-pre-wrap tracking-[0.01em]">
+                              {message.content}
+                            </p>
+                          </div>
+                        )}
+                      </div>
                     </div>
                   </div>
                 ))}
 
                 {loading && messages.length > 0 && (
-                  <div className="ml-0 border-l-2 border-blue-500/30 pl-3 py-1">
-                    <span className="text-[9px] font-[var(--font-mono)] text-[#555] uppercase tracking-widest flex items-center gap-1.5">
-                      <span className="inline-flex gap-0.5">
-                        <span className="w-1 h-1 bg-blue-500/60 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                        <span className="w-1 h-1 bg-blue-500/60 rounded-full animate-bounce" style={{ animationDelay: '140ms' }} />
-                        <span className="w-1 h-1 bg-blue-500/60 rounded-full animate-bounce" style={{ animationDelay: '280ms' }} />
-                      </span>
-                    </span>
+                  <div className="flex justify-start">
+                    <div className="relative max-w-[88%] overflow-hidden rounded-[22px] border border-blue-500/14 bg-[linear-gradient(160deg,rgba(13,21,36,0.9),rgba(7,11,18,0.96))] px-4 py-3 shadow-[0_16px_34px_rgba(0,0,0,0.2)]">
+                      <span className="absolute inset-x-0 top-0 h-px bg-[linear-gradient(90deg,transparent,rgba(96,165,250,0.52),transparent)]" />
+                      <div className="flex items-center gap-2 text-[9px] font-[var(--font-mono)] uppercase tracking-[0.18em] text-[#6f87a0]">
+                        <span className="inline-flex h-5 items-center rounded-full border border-blue-400/15 bg-blue-400/8 px-2 text-[8px] font-black tracking-[0.2em] text-blue-300">
+                          LIVE
+                        </span>
+                        <span className="inline-flex gap-0.5">
+                          <span className="h-1 w-1 rounded-full bg-blue-400/80 animate-bounce" style={{ animationDelay: '0ms' }} />
+                          <span className="h-1 w-1 rounded-full bg-cyan-300/80 animate-bounce" style={{ animationDelay: '140ms' }} />
+                          <span className="h-1 w-1 rounded-full bg-blue-200/80 animate-bounce" style={{ animationDelay: '280ms' }} />
+                        </span>
+                        正在继续分析
+                      </div>
+                    </div>
                   </div>
                 )}
               </>

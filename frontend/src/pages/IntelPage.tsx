@@ -1,4 +1,4 @@
-import { useDeferredValue, useEffect, useState } from 'react'
+import { useDeferredValue, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { MainLayout } from '@/layouts/MainLayout'
 import { useIntelStore, type IntelFilters, type IntelItem } from '@/stores/useIntelStore'
@@ -46,6 +46,92 @@ function formatFullDate(value: string | null) {
   }).format(new Date(value))
 }
 
+function confirmationScore(count: number): number {
+  if (count <= 1) return 0.30
+  if (count === 2) return 0.60
+  if (count === 3) return 0.85
+  return 1.0
+}
+
+function clampScore(value: number): number {
+  return Math.max(0, Math.min(1, value || 0))
+}
+
+function formatScore(value: number): string {
+  return `${Math.round(clampScore(value) * 100)}%`
+}
+
+function formatElapsed(from: string | null, to: string | null) {
+  if (!from || !to) return '--'
+  const diffMs = Math.max(new Date(to).getTime() - new Date(from).getTime(), 0)
+  const diffMin = Math.round(diffMs / 60000)
+  if (diffMin < 1) return '<1m'
+  if (diffMin < 60) return `${diffMin}m`
+  const diffHour = Math.round(diffMin / 60)
+  if (diffHour < 24) return `${diffHour}h`
+  const diffDay = Math.round(diffHour / 24)
+  return `${diffDay}d`
+}
+
+function ConfidenceTooltip({ item }: { item: IntelItem }) {
+  const rows = [
+    { label: '来源可信度', value: item.source_score ?? 0.5, weight: '30%', extra: item.source_name },
+    { label: '时效性', value: item.freshness_score ?? 0.5, weight: '20%', extra: `录入时差 ${formatElapsed(item.published_at, item.ingested_at)}` },
+    { label: '多源印证', value: confirmationScore(item.confirmation_count ?? 1), weight: '20%', extra: `${item.confirmation_count ?? 1} 源` },
+    { label: '语义判断', value: item.semantic_score ?? 0.5, weight: '30%' },
+  ]
+
+  return (
+    <div className="pointer-events-none absolute left-1/2 top-full z-50 mt-2 w-64 -translate-x-1/2 rounded border border-white/12 bg-[#0d1117]/72 p-3 shadow-[0_10px_24px_rgba(0,0,0,0.28)] opacity-0 translate-y-1 transition-all duration-150 group-hover/confidence:translate-y-0 group-hover/confidence:opacity-100 group-focus-within/confidence:translate-y-0 group-focus-within/confidence:opacity-100">
+      <div className="mb-2 flex items-center justify-between">
+        <div className="text-[9px] font-black uppercase tracking-widest text-[#8b949e]">置信度构成</div>
+        <div className="text-[8px] font-bold font-[var(--font-mono)] text-[#666]">30 / 20 / 20 / 30</div>
+      </div>
+      {rows.map(row => (
+        <div key={row.label} className="mb-2 last:mb-0">
+          <div className="mb-1 flex items-center justify-between gap-3">
+            <div className="text-[9px] text-[#8b949e]">{row.label}</div>
+            <div className="min-w-0 truncate text-[8px] font-bold font-[var(--font-mono)] text-[#666]">{row.weight}{row.extra ? ` · ${row.extra}` : ''}</div>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-[#21262d]">
+              <div className="h-full rounded-full bg-blue-500" style={{ width: formatScore(row.value) }} />
+            </div>
+            <div className="w-10 shrink-0 text-right text-[9px] font-black font-[var(--font-mono)] text-white">{formatScore(row.value)}</div>
+          </div>
+        </div>
+      ))}
+      <div className="mt-2 pt-1.5 border-t border-[#21262d] flex justify-between items-center">
+        <span className="text-[9px] text-[#8b949e]">综合置信度</span>
+        <span className="text-[10px] font-black font-[var(--font-mono)] text-white">{formatScore(item.confidence)}</span>
+      </div>
+    </div>
+  )
+}
+
+function ConfidenceValue({
+  item,
+  className,
+  showLabel = false,
+}: {
+  item: IntelItem
+  className: string
+  showLabel?: boolean
+}) {
+  return (
+    <span className="group/confidence relative inline-flex items-center">
+      <span
+        tabIndex={0}
+        title="悬浮查看置信度构成"
+        className={`${className} cursor-help underline decoration-dotted underline-offset-2 outline-none transition-colors focus-visible:text-white`}
+      >
+        {showLabel ? `置信度: ${formatScore(item.confidence)}` : formatScore(item.confidence)}
+      </span>
+      <ConfidenceTooltip item={item} />
+    </span>
+  )
+}
+
 export function IntelPage() {
   const navigate = useNavigate()
   const feed = useIntelStore((state) => state.feed)
@@ -67,6 +153,9 @@ export function IntelPage() {
   const openAiWithItem = useIntelAiStore((state) => state.openWithItem)
   const setGlobalAiItem = useIntelAiStore((state) => state.setItem)
   const [queryInput, setQueryInput] = useState(filters.q)
+  const [searchOpen, setSearchOpen] = useState(false)
+  const searchRegionRef = useRef<HTMLDivElement | null>(null)
+  const searchInputRef = useRef<HTMLInputElement | null>(null)
   const deferredQuery = useDeferredValue(queryInput.trim())
 
   useEffect(() => {
@@ -85,6 +174,24 @@ export function IntelPage() {
       setGlobalAiItem(nextItem)
     }
   }, [feed, globalAiItem, setGlobalAiItem])
+
+  useEffect(() => {
+    if (!searchOpen) return
+    searchInputRef.current?.focus()
+  }, [searchOpen])
+
+  useEffect(() => {
+    if (!searchOpen) return
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!searchRegionRef.current?.contains(event.target as Node)) {
+        setSearchOpen(false)
+      }
+    }
+
+    document.addEventListener('pointerdown', handlePointerDown)
+    return () => document.removeEventListener('pointerdown', handlePointerDown)
+  }, [searchOpen])
 
   const selectedItem = feed.find((item) => item.id === selectedId) || feed[0] || null
 
@@ -133,16 +240,6 @@ export function IntelPage() {
 
           {/* 过滤器 */}
           <div className="flex items-center gap-2 shrink-0 ml-6">
-            <div className="relative">
-              <svg className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-[#555]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
-              <input
-                value={queryInput}
-                onChange={(e) => setQueryInput(e.target.value)}
-                placeholder="搜索关键词..."
-                className="w-40 md:w-56 pl-6 pr-2 py-1 bg-[#111] border border-[#333] text-[10px] font-bold font-[var(--font-mono)] uppercase focus:border-blue-500 outline-none text-white placeholder-[#555] transition-colors"
-              />
-            </div>
-            
             <select
               value={filters.symbol}
               onChange={(e) => handleFilterChange({ symbol: e.target.value })}
@@ -182,10 +279,64 @@ export function IntelPage() {
           
           {/* 左侧栏：高密度情报流 */}
           <aside className="w-[380px] xl:w-[420px] flex flex-col border-r border-[#222] bg-[#050505] shrink-0">
-            <div className="flex items-center justify-between px-4 py-2 border-b border-[#222] bg-[#0A0A0A] shrink-0">
-              <span className="text-[9px] font-black uppercase tracking-widest text-[#666]">实时情报流</span>
+            <div className="relative flex items-center justify-between gap-3 px-4 py-2.5 border-b border-[#222] bg-[#0A0A0A] shrink-0">
+              <div ref={searchRegionRef} className="relative flex items-center gap-2 min-w-0">
+                <span className="shrink-0 text-[9px] font-black uppercase tracking-widest text-[#666]">实时情报流</span>
+                <button
+                  type="button"
+                  onClick={() => setSearchOpen((open) => !open)}
+                  aria-label={searchOpen ? '收起搜索' : '打开搜索'}
+                  className={`relative flex h-6.5 w-6.5 shrink-0 items-center justify-center rounded-full border transition-all ${
+                    searchOpen || queryInput
+                      ? 'border-blue-400/40 bg-blue-500/12 text-blue-200 shadow-[0_0_0_1px_rgba(96,165,250,0.12),0_6px_18px_rgba(15,23,42,0.28)]'
+                      : 'border-white/8 bg-white/[0.03] text-[#61748a] hover:border-white/14 hover:text-[#9fb4cb]'
+                  }`}
+                  title="搜索情报"
+                >
+                  <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                  </svg>
+                  {queryInput && (
+                    <span className="absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full bg-blue-300" />
+                  )}
+                </button>
+
+                {searchOpen && (
+                  <div className="absolute left-0 top-full z-20 mt-2 w-[220px] rounded-2xl border border-white/10 bg-[linear-gradient(180deg,rgba(11,16,24,0.96),rgba(6,9,14,0.94))] p-2 shadow-[0_16px_40px_rgba(0,0,0,0.38)] backdrop-blur-xl">
+                    <div className="group/search relative">
+                      <svg className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#58708c] transition-colors group-focus-within/search:text-blue-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                      </svg>
+                      <input
+                        ref={searchInputRef}
+                        aria-label="搜索情报"
+                        value={queryInput}
+                        onChange={(e) => setQueryInput(e.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Escape') {
+                            event.preventDefault()
+                            setSearchOpen(false)
+                          }
+                        }}
+                        placeholder="搜索标题、摘要、关键词"
+                        className="h-9 w-full rounded-xl border border-white/8 bg-white/[0.04] pl-10 pr-16 text-[11px] font-bold font-[var(--font-mono)] text-white outline-none transition-all placeholder:text-[#4d5a69] focus:border-blue-400/40 focus:bg-[#0d1520] focus:shadow-[0_0_0_1px_rgba(96,165,250,0.14)]"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setQueryInput('')
+                          setSearchOpen(false)
+                        }}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 rounded-md border border-white/8 px-1.5 py-0.5 text-[9px] font-black font-[var(--font-mono)] text-[#7e8b99] transition-colors hover:border-white/14 hover:text-white"
+                      >
+                        清空
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
               {/* 置信度快捷筛选 */}
-              <div className="flex gap-1">
+              <div className="flex gap-1 shrink-0">
                 {CONFIDENCE_OPTIONS.map((opt) => (
                   <button
                     key={opt.value}
@@ -200,6 +351,7 @@ export function IntelPage() {
                   </button>
                 ))}
               </div>
+
             </div>
 
             <div className="flex-1 overflow-y-auto custom-scrollbar">
@@ -239,7 +391,7 @@ export function IntelPage() {
                       >
                         <div className="w-14 shrink-0 text-right pt-0.5">
                           <div className="text-[10px] font-bold font-[var(--font-mono)] text-[#666]">{formatTime(item.published_at)}</div>
-                          <div className={`text-[9px] font-black font-[var(--font-mono)] mt-1 ${signalColor}`}>{(item.confidence * 100).toFixed(0)}%</div>
+                          <div className={`mt-1 text-[9px] font-black font-[var(--font-mono)] ${signalColor}`}>{formatScore(item.confidence)}</div>
                         </div>
                         
                         <div className="flex-1 min-w-0">
@@ -293,9 +445,11 @@ export function IntelPage() {
                   <div className={`px-2 py-1 text-[10px] font-black uppercase tracking-widest ${getSignalBg(selectedItem.signal)}`}>
                     {SIGNAL_LABELS[selectedItem.signal] || selectedItem.signal}
                   </div>
-                  <div className="text-[12px] font-black font-[var(--font-mono)] text-white">
-                    置信度: {(selectedItem.confidence * 100).toFixed(0)}%
-                  </div>
+                  <ConfidenceValue
+                    item={selectedItem}
+                    showLabel
+                    className="text-[12px] font-black font-[var(--font-mono)] text-white"
+                  />
                   <div className="flex-1" />
                   <div className="text-[10px] font-bold font-[var(--font-mono)] text-[#666] uppercase text-right leading-relaxed">
                     发布: {formatFullDate(selectedItem.published_at)}<br />

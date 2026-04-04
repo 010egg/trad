@@ -1,7 +1,25 @@
 import axios from 'axios'
 
+export const API_BASE_URL = '/api/v1'
+
+export function buildApiHeaders(headers?: HeadersInit) {
+  const merged = new Headers(headers)
+  const token = localStorage.getItem('access_token')
+  if (token) {
+    merged.set('Authorization', `Bearer ${token}`)
+  }
+  return merged
+}
+
+export function handleApiUnauthorized(status?: number) {
+  if (status !== 401) return
+  localStorage.removeItem('access_token')
+  localStorage.removeItem('refresh_token')
+  window.location.href = '/login'
+}
+
 const api = axios.create({
-  baseURL: '/api/v1',
+  baseURL: API_BASE_URL,
   timeout: 20000,
 })
 
@@ -30,11 +48,7 @@ api.interceptors.response.use(
     return data
   },
   (err) => {
-    if (err.response?.status === 401) {
-      localStorage.removeItem('access_token')
-      localStorage.removeItem('refresh_token')
-      window.location.href = '/login'
-    }
+    handleApiUnauthorized(err.response?.status)
     return Promise.reject(err)
   }
 )

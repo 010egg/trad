@@ -10,6 +10,10 @@ class IntelFeedItem(BaseModel):
     summary_ai: str
     signal: str
     confidence: float
+    source_score: float = 0.5
+    freshness_score: float = 0.5
+    semantic_score: float = 0.5
+    confirmation_count: int = 1
     reasoning: str
     category: str
     published_at: str

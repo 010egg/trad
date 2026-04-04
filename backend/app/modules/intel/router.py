@@ -1,4 +1,7 @@
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
 from app.deps import DB
 from app.modules.auth.models import User
@@ -17,6 +20,8 @@ from app.modules.intel.service import (
     get_intel_filters,
     query_intel_feed,
     schedule_refresh_if_stale,
+    stream_chat_with_intel_assistant,
+    stream_chat_with_intel_item,
     trigger_intel_refresh,
 )
 from app.modules.trade.service import TradeService, build_user_llm_runtime_config, has_custom_llm_settings
@@ -26,6 +31,11 @@ router = APIRouter()
 
 def _wrap(data):
     return {"code": 0, "data": data, "message": "ok"}
+
+
+def _sse_frame(event: str, data: dict) -> bytes:
+    payload = json.dumps(data, ensure_ascii=False)
+    return f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
 
 
 @router.get("/feed")
@@ -107,6 +117,41 @@ async def global_chat(req: IntelChatRequest, db: DB, user: User = Depends(get_cu
     return _wrap(IntelChatResponse(**data).model_dump())
 
 
+@router.post("/chat/stream")
+async def global_chat_stream(req: IntelChatRequest, db: DB, user: User = Depends(get_current_user)):
+    trade_service = TradeService(db, user.id)
+    trade_settings = await trade_service.get_trade_settings()
+    try:
+        stream = await stream_chat_with_intel_assistant(
+            req.question,
+            [message.model_dump() for message in req.history],
+            llm_config=build_user_llm_runtime_config(trade_settings),
+            allow_env_fallback=not has_custom_llm_settings(trade_settings),
+            user_settings=trade_settings,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def event_stream():
+        try:
+            async for event in stream:
+                event_type = str(event.get("type") or "message")
+                payload = {key: value for key, value in event.items() if key != "type"}
+                yield _sse_frame(event_type, payload)
+        except Exception as exc:
+            yield _sse_frame("error", {"detail": str(exc)})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.post("/{item_id}/chat")
 async def chat(item_id: str, req: IntelChatRequest, db: DB, user: User = Depends(get_current_user)):
     trade_service = TradeService(db, user.id)
@@ -126,3 +171,42 @@ async def chat(item_id: str, req: IntelChatRequest, db: DB, user: User = Depends
     if data is None:
         raise HTTPException(status_code=404, detail="情报不存在")
     return _wrap(IntelChatResponse(**data).model_dump())
+
+
+@router.post("/{item_id}/chat/stream")
+async def chat_stream(item_id: str, req: IntelChatRequest, db: DB, user: User = Depends(get_current_user)):
+    trade_service = TradeService(db, user.id)
+    trade_settings = await trade_service.get_trade_settings()
+    try:
+        stream = await stream_chat_with_intel_item(
+            db,
+            item_id,
+            req.question,
+            [message.model_dump() for message in req.history],
+            llm_config=build_user_llm_runtime_config(trade_settings),
+            allow_env_fallback=not has_custom_llm_settings(trade_settings),
+            user_settings=trade_settings,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if stream is None:
+        raise HTTPException(status_code=404, detail="情报不存在")
+
+    async def event_stream():
+        try:
+            async for event in stream:
+                event_type = str(event.get("type") or "message")
+                payload = {key: value for key, value in event.items() if key != "type"}
+                yield _sse_frame(event_type, payload)
+        except Exception as exc:
+            yield _sse_frame("error", {"detail": str(exc)})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

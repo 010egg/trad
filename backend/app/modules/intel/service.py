@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from html import unescape
 from time import monotonic
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
 import httpx
@@ -25,6 +25,7 @@ from app.modules.market.service import SUPPORTED_SYMBOLS
 
 PROXY = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
 BINANCE_ANNOUNCEMENTS_URL = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
+BINANCE_ANNOUNCEMENTS_MAX_PAGE_SIZE = 5
 COINTELEGRAPH_RSS_URL = "https://cointelegraph.com/rss"
 FRED_BASE_URL = "https://api.stlouisfed.org/fred"
 
@@ -88,6 +89,85 @@ NEGATIVE_KEYWORDS = {
 _refresh_lock = asyncio.Lock()
 _refresh_task: asyncio.Task[dict[str, Any]] | None = None
 
+# 来源可信度映射（部分匹配 source_name 小写）
+SOURCE_CREDIBILITY: dict[str, float] = {
+    "binance": 1.0,
+    "okx": 1.0,
+    "bybit": 0.95,
+    "fred": 0.90,
+    "coindesk": 0.85,
+    "the block": 0.85,
+    "reuters": 0.85,
+    "bloomberg": 0.85,
+    "cointelegraph": 0.75,
+    "decrypt": 0.65,
+}
+
+
+def _source_score(source_name: str) -> float:
+    key = source_name.lower()
+    for name, score in SOURCE_CREDIBILITY.items():
+        if name in key:
+            return score
+    return 0.50
+
+
+def _freshness_score(published_at: datetime | None, *, reference_at: datetime | None = None) -> float:
+    if not published_at:
+        return 0.5
+    anchor = reference_at or _utc_now_naive()
+    age_minutes = max((anchor - published_at).total_seconds() / 60, 0)
+    if age_minutes <= 30:
+        return 1.0
+    if age_minutes <= 120:
+        return 0.8
+    if age_minutes <= 360:
+        return 0.6
+    if age_minutes <= 1440:
+        return 0.3
+    return 0.1
+
+
+def _confirmation_score(count: int) -> float:
+    if count <= 1:
+        return 0.30
+    if count == 2:
+        return 0.60
+    if count == 3:
+        return 0.85
+    return 1.0
+
+
+def _multi_dim_confidence(
+    source_score: float,
+    freshness_score: float,
+    confirmation_count: int,
+    semantic_score: float,
+) -> float:
+    """四维加权置信度：来源30% + 时效20% + 多源印证20% + 语义30%"""
+    return round(
+        source_score * 0.30
+        + freshness_score * 0.20
+        + _confirmation_score(confirmation_count) * 0.20
+        + semantic_score * 0.30,
+        2,
+    )
+
+
+def _derive_semantic_score(
+    confidence: float,
+    source_score: float,
+    freshness_score: float,
+    confirmation_count: int,
+) -> float:
+    semantic_score = (
+        confidence
+        - source_score * 0.30
+        - freshness_score * 0.20
+        - _confirmation_score(confirmation_count) * 0.20
+    ) / 0.30
+    return round(max(0.0, min(semantic_score, 1.0)), 2)
+
 
 def _utc_now_naive() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
@@ -111,8 +191,18 @@ def _parse_published_at(value: str | int | float | None) -> datetime:
     if isinstance(value, (int, float)):
         return datetime.fromtimestamp(float(value) / 1000, tz=UTC).replace(tzinfo=None)
     if isinstance(value, str) and value:
+        normalized = value.strip()
         try:
-            parsed = parsedate_to_datetime(value)
+            if normalized.endswith("Z"):
+                normalized = f"{normalized[:-1]}+00:00"
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed.astimezone(UTC).replace(tzinfo=None)
+        except ValueError:
+            pass
+        try:
+            parsed = parsedate_to_datetime(normalized)
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=UTC)
             return parsed.astimezone(UTC).replace(tzinfo=None)
@@ -152,6 +242,7 @@ def _infer_category(item: dict[str, Any]) -> str:
 
 
 def _infer_signal(item: dict[str, Any]) -> tuple[str, float, str]:
+    """返回 (signal, semantic_score, reasoning)，semantic_score 仅为语义维度得分"""
     text = " ".join(
         str(item.get(key) or "")
         for key in ("title", "content_raw", "summary_ai")
@@ -161,28 +252,37 @@ def _infer_signal(item: dict[str, Any]) -> tuple[str, float, str]:
     negative_hits = sum(1 for word in NEGATIVE_KEYWORDS if word in text)
 
     if positive_hits > negative_hits:
-        confidence = min(0.82, 0.45 + 0.08 * positive_hits)
-        return "BULLISH", confidence, "Keyword-based positive catalysts detected."
+        semantic = min(0.90, 0.50 + 0.08 * positive_hits)
+        return "BULLISH", semantic, "Keyword-based positive catalysts detected."
     if negative_hits > positive_hits:
-        confidence = min(0.82, 0.45 + 0.08 * negative_hits)
-        return "BEARISH", confidence, "Keyword-based downside risk detected."
+        semantic = min(0.90, 0.50 + 0.08 * negative_hits)
+        return "BEARISH", semantic, "Keyword-based downside risk detected."
     return "NEUTRAL", 0.35, "No directional catalyst was strong enough."
 
 
 def _fallback_enrichment(item: dict[str, Any]) -> dict[str, Any]:
     symbols = _extract_symbols(" ".join(str(item.get(key) or "") for key in ("title", "content_raw")))
-    signal, confidence, reasoning = _infer_signal(item)
+    signal, semantic_score, reasoning = _infer_signal(item)
     summary = _strip_html(str(item.get("content_raw") or "")) or str(item.get("title") or "")
     summary = summary[:280].strip()
+
+    src_score = _source_score(str(item.get("source_name") or ""))
+    fresh_score = _freshness_score(item.get("published_at"))
+    # confirmation_count 在 upsert 阶段批量计算，此处先用 1
+    confidence = _multi_dim_confidence(src_score, fresh_score, 1, semantic_score)
+
     return {
         **item,
         "summary_ai": summary,
         "signal": signal,
-        "confidence": round(confidence, 2),
+        "semantic_score": round(semantic_score, 2),
+        "source_score": round(src_score, 2),
+        "freshness_score": round(fresh_score, 2),
+        "confidence": confidence,
         "reasoning": reasoning,
         "category": _infer_category(item),
         "symbols": [symbol for symbol in symbols if symbol in SUPPORTED_INTEL_SYMBOLS],
-        "score": round(confidence, 2),
+        "score": confidence,
     }
 
 
@@ -299,6 +399,260 @@ def _clean_ai_text(value: str) -> str:
     text = text.replace("\r\n", "\n")
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def _build_chat_messages(runtime_config: dict[str, str], prompt: str) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "system",
+            "content": _resolve_system_prompt(runtime_config),
+        },
+        {
+            "role": "user",
+            "content": prompt,
+        },
+    ]
+
+
+async def _iter_sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, str]]:
+    event_name = "message"
+    data_lines: list[str] = []
+
+    async for raw_line in response.aiter_lines():
+        line = raw_line.rstrip("\r")
+        if not line:
+            if data_lines:
+                yield event_name, "\n".join(data_lines)
+            event_name = "message"
+            data_lines = []
+            continue
+
+        if line.startswith(":"):
+            continue
+
+        field, _, raw_value = line.partition(":")
+        value = raw_value[1:] if raw_value.startswith(" ") else raw_value
+        if field == "event":
+            event_name = value or "message"
+        elif field == "data":
+            data_lines.append(value)
+
+    if data_lines:
+        yield event_name, "\n".join(data_lines)
+
+
+def _flatten_stream_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return ""
+
+    parts: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            parts.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+            continue
+        if isinstance(text, dict):
+            nested_value = text.get("value")
+            if isinstance(nested_value, str):
+                parts.append(nested_value)
+    return "".join(parts)
+
+
+def _extract_openai_stream_text(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return ""
+
+    choice = choices[0]
+    delta = choice.get("delta") or {}
+    if isinstance(delta, dict):
+        content = delta.get("content")
+        text = _flatten_stream_text(content)
+        if text:
+            return text
+
+    message = choice.get("message") or {}
+    if isinstance(message, dict):
+        return _flatten_stream_text(message.get("content"))
+
+    return ""
+
+
+def _extract_anthropic_stream_text(payload: dict[str, Any]) -> str:
+    if payload.get("type") != "content_block_delta":
+        return ""
+
+    delta = payload.get("delta") or {}
+    if not isinstance(delta, dict) or delta.get("type") != "text_delta":
+        return ""
+    return str(delta.get("text") or "")
+
+
+def _extract_stream_error_message(payload: dict[str, Any]) -> str:
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message")
+        if message:
+            return str(message)
+        detail = error.get("detail")
+        if detail:
+            return str(detail)
+    if payload.get("message"):
+        return str(payload["message"])
+    return "流式响应失败"
+
+
+async def _request_chat_completion_stream(
+    runtime_config: dict[str, str],
+    messages: list[dict[str, str]],
+    *,
+    temperature: float = 0.2,
+    max_tokens: int | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    provider = str(runtime_config.get("provider") or "OPENAI").upper()
+
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True, proxy=PROXY) as client:
+        if provider == "ANTHROPIC":
+            system_prompt = ""
+            user_content = ""
+            for message in messages:
+                if message["role"] == "system":
+                    system_prompt = message["content"]
+                elif message["role"] == "user":
+                    user_content = message["content"]
+
+            request_body: dict[str, Any] = {
+                "model": runtime_config["model"],
+                "temperature": temperature,
+                "max_tokens": max_tokens or 512,
+                "system": system_prompt,
+                "stream": True,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": user_content}],
+                    }
+                ],
+            }
+
+            async with client.stream(
+                "POST",
+                f"{runtime_config['base_url'].rstrip('/')}/v1/messages",
+                headers={
+                    "x-api-key": runtime_config["api_key"],
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                json=request_body,
+            ) as response:
+                response.raise_for_status()
+                async for _, data in _iter_sse_events(response):
+                    if not data:
+                        continue
+                    payload = json.loads(data)
+                    if payload.get("type") == "error":
+                        raise RuntimeError(_extract_stream_error_message(payload))
+
+                    message = payload.get("message") or {}
+                    if isinstance(message, dict) and message.get("model"):
+                        yield {"type": "meta", "model": str(message["model"])}
+
+                    text = _extract_anthropic_stream_text(payload)
+                    if text:
+                        yield {"type": "delta", "content": text}
+            return
+
+        request_body = {
+            "model": runtime_config["model"],
+            "temperature": temperature,
+            "messages": messages,
+            "stream": True,
+        }
+        if max_tokens is not None:
+            request_body["max_tokens"] = max_tokens
+
+        async with client.stream(
+            "POST",
+            f"{runtime_config['base_url'].rstrip('/')}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {runtime_config['api_key']}",
+                "Content-Type": "application/json",
+            },
+            json=request_body,
+        ) as response:
+            response.raise_for_status()
+            async for _, data in _iter_sse_events(response):
+                if not data:
+                    continue
+                if data == "[DONE]":
+                    break
+
+                payload = json.loads(data)
+                if payload.get("error"):
+                    raise RuntimeError(_extract_stream_error_message(payload))
+
+                if payload.get("model"):
+                    yield {"type": "meta", "model": str(payload["model"])}
+
+                text = _extract_openai_stream_text(payload)
+                if text:
+                    yield {"type": "delta", "content": text}
+
+
+async def _stream_chat_reply(
+    runtime_config: dict[str, str],
+    prompt: str,
+    *,
+    temperature: float = 0.3,
+    max_tokens: int | None = 700,
+) -> AsyncIterator[dict[str, Any]]:
+    started_at = monotonic()
+    model = str(runtime_config["model"])
+    reply_parts: list[str] = []
+    total_length = 0
+
+    async for event in _request_chat_completion_stream(
+        runtime_config,
+        _build_chat_messages(runtime_config, prompt),
+        temperature=temperature,
+        max_tokens=max_tokens,
+    ):
+        if event["type"] == "meta":
+            next_model = str(event.get("model") or "").strip()
+            if next_model:
+                model = next_model
+            continue
+
+        chunk = str(event.get("content") or "")
+        if not chunk or total_length >= 4000:
+            continue
+
+        remaining = 4000 - total_length
+        clipped = chunk[:remaining]
+        if not clipped:
+            continue
+
+        reply_parts.append(clipped)
+        total_length += len(clipped)
+        yield {"type": "delta", "content": clipped}
+
+    reply = "".join(reply_parts).strip()
+    if not reply:
+        raise RuntimeError("AI 未返回有效内容")
+
+    yield {
+        "type": "done",
+        "reply": reply,
+        "model": model,
+        "latency_ms": int((monotonic() - started_at) * 1000),
+    }
 
 
 async def _request_chat_completion(
@@ -505,35 +859,49 @@ def _build_general_chat_payload(question: str, history: list[dict[str, str]]) ->
 
 
 async def fetch_binance_announcements(limit: int = 8) -> list[dict[str, Any]]:
+    # Binance's CMS endpoint rejects pageSize values above 5, so fetch larger
+    # result sets across multiple pages.
     async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, proxy=PROXY) as client:
-        response = await client.get(
-            BINANCE_ANNOUNCEMENTS_URL,
-            params={"type": 1, "pageNo": 1, "pageSize": limit},
-        )
-        response.raise_for_status()
-        payload = response.json()
+        items: list[dict[str, Any]] = []
+        seen_codes: set[str] = set()
+        page_no = 1
 
-    items: list[dict[str, Any]] = []
-    for catalog in payload.get("data", {}).get("catalogs", []):
-        for article in catalog.get("articles", []):
-            code = str(article.get("code") or "")
-            title = str(article.get("title") or "").strip()
-            if not code or not title:
-                continue
-            items.append(
-                {
-                    "source_type": "external",
-                    "source_name": "Binance Announcements",
-                    "source_item_id": code,
-                    "title": title,
-                    "source_url": f"https://www.binance.com/en/support/announcement/detail/{code}",
-                    "content_raw": title,
-                    "published_at": _parse_published_at(article.get("releaseDate")),
-                    "category": "exchange",
-                }
+        while len(items) < limit:
+            page_size = min(limit - len(items), BINANCE_ANNOUNCEMENTS_MAX_PAGE_SIZE)
+            response = await client.get(
+                BINANCE_ANNOUNCEMENTS_URL,
+                params={"type": 1, "pageNo": page_no, "pageSize": page_size},
             )
-            if len(items) >= limit:
-                return items
+            response.raise_for_status()
+            payload = response.json()
+
+            added_in_page = 0
+            for catalog in payload.get("data", {}).get("catalogs", []):
+                for article in catalog.get("articles", []):
+                    code = str(article.get("code") or "")
+                    title = str(article.get("title") or "").strip()
+                    if not code or not title or code in seen_codes:
+                        continue
+                    seen_codes.add(code)
+                    items.append(
+                        {
+                            "source_type": "external",
+                            "source_name": "Binance Announcements",
+                            "source_item_id": code,
+                            "title": title,
+                            "source_url": f"https://www.binance.com/en/support/announcement/detail/{code}",
+                            "content_raw": title,
+                            "published_at": _parse_published_at(article.get("releaseDate")),
+                            "category": "exchange",
+                        }
+                    )
+                    added_in_page += 1
+                    if len(items) >= limit:
+                        return items
+
+            if added_in_page == 0:
+                break
+            page_no += 1
     return items
 
 
@@ -628,7 +996,7 @@ async def fetch_fred_items() -> list[dict[str, Any]]:
                         "title": title,
                         "source_url": f"https://fred.stlouisfed.org/series/{series['id']}",
                         "content_raw": content,
-                        "published_at": _parse_published_at(f"{date}T00:00:00"),
+                        "published_at": _parse_published_at(date),
                         "category": "macro",
                     }
                 )
@@ -721,10 +1089,14 @@ async def enrich_intel_item(
     ]
 
     try:
-        confidence = float(parsed.get("confidence", enriched["confidence"]))
+        semantic_score = float(parsed.get("confidence", enriched.get("semantic_score", 0.5)))
     except Exception:
-        confidence = float(enriched["confidence"])
-    confidence = max(0.0, min(confidence, 1.0))
+        semantic_score = float(enriched.get("semantic_score", 0.5))
+    semantic_score = max(0.0, min(semantic_score, 1.0))
+
+    src_score = float(enriched.get("source_score", 0.5))
+    fresh_score = float(enriched.get("freshness_score", 0.5))
+    confidence = _multi_dim_confidence(src_score, fresh_score, 1, semantic_score)
 
     summary = str(parsed.get("summary") or enriched["summary_ai"]).strip() or enriched["summary_ai"]
     reasoning = str(parsed.get("reasoning") or enriched["reasoning"]).strip() or enriched["reasoning"]
@@ -733,11 +1105,14 @@ async def enrich_intel_item(
         **enriched,
         "summary_ai": summary[:480],
         "signal": signal,
-        "confidence": round(confidence, 2),
+        "semantic_score": round(semantic_score, 2),
+        "source_score": round(src_score, 2),
+        "freshness_score": round(fresh_score, 2),
+        "confidence": confidence,
         "reasoning": reasoning[:320],
         "category": category,
         "symbols": list(dict.fromkeys(symbols)) or enriched["symbols"],
-        "score": round(confidence, 2),
+        "score": confidence,
     }
 
 
@@ -778,16 +1153,7 @@ async def chat_with_intel_item(
     try:
         payload = await _request_chat_completion(
             runtime_config,
-            [
-                {
-                    "role": "system",
-                    "content": _resolve_system_prompt(runtime_config),
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
-            ],
+            _build_chat_messages(runtime_config, prompt),
             temperature=0.3,
             max_tokens=700,
         )
@@ -834,16 +1200,7 @@ async def chat_with_intel_assistant(
     try:
         payload = await _request_chat_completion(
             runtime_config,
-            [
-                {
-                    "role": "system",
-                    "content": _resolve_system_prompt(runtime_config),
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
-            ],
+            _build_chat_messages(runtime_config, prompt),
             temperature=0.3,
             max_tokens=700,
         )
@@ -862,6 +1219,67 @@ async def chat_with_intel_assistant(
         "model": str(payload.get("model") or runtime_config["model"]),
         "latency_ms": int((monotonic() - started_at) * 1000),
     }
+
+
+async def stream_chat_with_intel_item(
+    db: AsyncSession,
+    item_id: str,
+    question: str,
+    history: list[dict[str, str]] | None = None,
+    *,
+    llm_config: dict[str, str] | None = None,
+    allow_env_fallback: bool = True,
+    user_settings: Any | None = None,
+) -> AsyncIterator[dict[str, Any]] | None:
+    stmt = (
+        select(IntelItem)
+        .where(IntelItem.id == item_id, IntelItem.is_active.is_(True))
+        .options(selectinload(IntelItem.symbol_links))
+    )
+    item = (await db.execute(stmt)).scalar_one_or_none()
+    if item is None:
+        return None
+
+    runtime_config = _resolve_runtime_config(
+        llm_config,
+        allow_env_fallback=allow_env_fallback,
+    )
+    if runtime_config is None:
+        raise RuntimeError(
+            describe_llm_unavailable_reason(
+                llm_config=llm_config,
+                allow_env_fallback=allow_env_fallback,
+                user_settings=user_settings,
+            )
+        )
+
+    prompt = _build_intel_chat_payload(item, question, history or [])
+    return _stream_chat_reply(runtime_config, prompt, temperature=0.3, max_tokens=700)
+
+
+async def stream_chat_with_intel_assistant(
+    question: str,
+    history: list[dict[str, str]] | None = None,
+    *,
+    llm_config: dict[str, str] | None = None,
+    allow_env_fallback: bool = True,
+    user_settings: Any | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    runtime_config = _resolve_runtime_config(
+        llm_config,
+        allow_env_fallback=allow_env_fallback,
+    )
+    if runtime_config is None:
+        raise RuntimeError(
+            describe_llm_unavailable_reason(
+                llm_config=llm_config,
+                allow_env_fallback=allow_env_fallback,
+                user_settings=user_settings,
+            )
+        )
+
+    prompt = _build_general_chat_payload(question, history or [])
+    return _stream_chat_reply(runtime_config, prompt, temperature=0.3, max_tokens=700)
 
 
 async def _find_existing_item(db: AsyncSession, payload: dict[str, Any]) -> IntelItem | None:
@@ -901,12 +1319,41 @@ async def _sync_item_symbols(db: AsyncSession, item: IntelItem, symbols: list[st
             db.add(IntelItemSymbol(intel_item_id=item.id, symbol=symbol))
 
 
+def _compute_confirmation_counts(items: list[dict[str, Any]]) -> list[int]:
+    """批内多源印证：同品种 + 发布时间相差 2 小时内的条目互相印证"""
+    counts = [1] * len(items)
+    for i, item in enumerate(items):
+        symbols_i = set(item.get("symbols") or [])
+        time_i: datetime | None = item.get("published_at")
+        for j, other in enumerate(items):
+            if i == j:
+                continue
+            symbols_j = set(other.get("symbols") or [])
+            if not symbols_i or not symbols_j or not (symbols_i & symbols_j):
+                continue
+            time_j: datetime | None = other.get("published_at")
+            if time_i and time_j and abs((time_i - time_j).total_seconds()) <= 7200:
+                counts[i] += 1
+    return counts
+
+
 async def upsert_intel_items(db: AsyncSession, items: list[dict[str, Any]]) -> dict[str, int]:
     created = 0
     updated = 0
     now = _utc_now_naive()
 
-    for payload in items:
+    confirmation_counts = _compute_confirmation_counts(items)
+
+    for idx, payload in enumerate(items):
+        confirmation_count = confirmation_counts[idx]
+        # 用最终 confirmation_count 重新计算置信度
+        src_score = float(payload.get("source_score") or _source_score(str(payload.get("source_name") or "")))
+        fresh_score = float(payload.get("freshness_score") or _freshness_score(payload.get("published_at")))
+        semantic_score = float(payload.get("semantic_score") or payload.get("confidence") or 0.35)
+        final_confidence = _multi_dim_confidence(src_score, fresh_score, confirmation_count, semantic_score)
+        payload = {**payload, "confidence": final_confidence, "score": final_confidence,
+                   "source_score": src_score, "confirmation_count": confirmation_count}
+
         existing = await _find_existing_item(db, payload)
         if existing is None:
             existing = IntelItem(
@@ -923,7 +1370,9 @@ async def upsert_intel_items(db: AsyncSession, items: list[dict[str, Any]]) -> d
                 category=str(payload.get("category") or "macro"),
                 published_at=payload.get("published_at") or now,
                 ingested_at=now,
-                score=float(payload.get("score") or payload.get("confidence") or 0.0),
+                score=float(payload.get("score") or 0.0),
+                source_score=float(payload.get("source_score") or 0.5),
+                confirmation_count=int(payload.get("confirmation_count") or 1),
                 is_active=True,
             )
             db.add(existing)
@@ -931,6 +1380,8 @@ async def upsert_intel_items(db: AsyncSession, items: list[dict[str, Any]]) -> d
             created += 1
         else:
             existing.source_type = str(payload.get("source_type") or existing.source_type)
+            existing.source_name = str(payload.get("source_name") or existing.source_name)
+            existing.source_item_id = str(payload.get("source_item_id") or "") or existing.source_item_id
             existing.title = str(payload.get("title") or existing.title)
             existing.source_url = str(payload.get("source_url") or existing.source_url)
             existing.content_raw = str(payload.get("content_raw") or existing.content_raw)
@@ -941,7 +1392,12 @@ async def upsert_intel_items(db: AsyncSession, items: list[dict[str, Any]]) -> d
             existing.category = str(payload.get("category") or existing.category)
             existing.published_at = payload.get("published_at") or existing.published_at
             existing.ingested_at = now
-            existing.score = float(payload.get("score") or payload.get("confidence") or existing.score or 0.0)
+            existing.score = float(payload.get("score") or existing.score or 0.0)
+            existing.source_score = float(payload.get("source_score") or existing.source_score or 0.5)
+            existing.confirmation_count = max(
+                int(payload.get("confirmation_count") or 1),
+                int(existing.confirmation_count or 1),
+            )
             existing.is_active = True
             updated += 1
 
@@ -1128,6 +1584,20 @@ def _cursor_clause(cursor: str | None):
 
 
 def serialize_intel_item(item: IntelItem) -> dict[str, Any]:
+    confidence = round(float(item.confidence or 0.0), 2)
+    source_score = round(float(item.source_score or 0.5), 2)
+    confirmation_count = int(item.confirmation_count or 1)
+    freshness_score = round(
+        _freshness_score(item.published_at, reference_at=item.ingested_at),
+        2,
+    )
+    semantic_score = _derive_semantic_score(
+        confidence,
+        source_score,
+        freshness_score,
+        confirmation_count,
+    )
+
     return {
         "id": item.id,
         "source_type": item.source_type,
@@ -1136,7 +1606,11 @@ def serialize_intel_item(item: IntelItem) -> dict[str, Any]:
         "source_url": item.source_url,
         "summary_ai": item.summary_ai,
         "signal": item.signal,
-        "confidence": round(float(item.confidence or 0.0), 2),
+        "confidence": confidence,
+        "source_score": source_score,
+        "freshness_score": freshness_score,
+        "semantic_score": semantic_score,
+        "confirmation_count": confirmation_count,
         "reasoning": item.reasoning,
         "category": item.category,
         "published_at": _datetime_to_iso(item.published_at),

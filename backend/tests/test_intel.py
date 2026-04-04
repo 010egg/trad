@@ -1,4 +1,7 @@
+from datetime import datetime
+
 import pytest
+from sqlalchemy import select
 
 
 async def _get_token(client):
@@ -12,6 +15,22 @@ async def _get_token(client):
         "password": "Test1234",
     })
     return resp.json()["data"]["access_token"]
+
+
+def _parse_sse_events(payload: str) -> list[tuple[str, str]]:
+    events: list[tuple[str, str]] = []
+    for block in payload.strip().split("\n\n"):
+        if not block.strip():
+            continue
+        event_type = "message"
+        data_lines: list[str] = []
+        for line in block.splitlines():
+            if line.startswith("event:"):
+                event_type = line.split(":", 1)[1].strip() or "message"
+            elif line.startswith("data:"):
+                data_lines.append(line.split(":", 1)[1].strip())
+        events.append((event_type, "\n".join(data_lines)))
+    return events
 
 
 @pytest.mark.asyncio
@@ -262,6 +281,197 @@ async def test_global_intel_chat_without_item_context(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_global_intel_chat_stream_returns_sse_events(client, monkeypatch):
+    token = await _get_token(client)
+
+    settings_resp = await client.put(
+        "/api/v1/trade/settings",
+        json={
+            "llm_enabled": True,
+            "llm_provider": "OPENAI",
+            "llm_base_url": "https://api.minimaxi.com",
+            "llm_model": "MiniMax-M2.7",
+            "llm_api_key": "sk-test-12345678",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert settings_resp.status_code == 200
+
+    async def fake_stream_chat_with_intel_assistant(
+        question,
+        history=None,
+        *,
+        llm_config=None,
+        allow_env_fallback=True,
+        user_settings=None,
+    ):
+        del allow_env_fallback, user_settings
+        assert question == "今天更该盯哪些市场风险？"
+        assert history == [{"role": "user", "content": "先给我一句话结论"}]
+        assert llm_config is not None
+        assert llm_config["model"] == "MiniMax-M2.7"
+
+        async def generator():
+            yield {"type": "delta", "content": "先盯风险资产波动，"}
+            yield {"type": "delta", "content": "再看 ETF 资金流。"}
+            yield {
+                "type": "done",
+                "reply": "先盯风险资产波动，再看 ETF 资金流。",
+                "model": "MiniMax-M2.7",
+                "latency_ms": 187,
+            }
+
+        return generator()
+
+    monkeypatch.setattr(
+        "app.modules.intel.router.stream_chat_with_intel_assistant",
+        fake_stream_chat_with_intel_assistant,
+    )
+
+    response = await client.post(
+        "/api/v1/intel/chat/stream",
+        json={
+            "question": "今天更该盯哪些市场风险？",
+            "history": [{"role": "user", "content": "先给我一句话结论"}],
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+
+    events = _parse_sse_events(response.text)
+    assert events == [
+        ("delta", '{"content": "先盯风险资产波动，"}'),
+        ("delta", '{"content": "再看 ETF 资金流。"}'),
+        (
+            "done",
+            '{"reply": "先盯风险资产波动，再看 ETF 资金流。", "model": "MiniMax-M2.7", "latency_ms": 187}',
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_intel_item_chat_stream_returns_sse_events(client, monkeypatch):
+    token = await _get_token(client)
+
+    async def fake_fetch_external_intel_items():
+        return [
+            {
+                "source_type": "external",
+                "source_name": "Binance Announcements",
+                "source_item_id": "binance-stream-1",
+                "title": "Binance launches SOL perpetuals after strong Solana demand",
+                "source_url": "https://example.com/binance-stream-1",
+                "content_raw": "Solana derivatives launch broadens access.",
+                "published_at": __import__("datetime").datetime(2026, 3, 21, 0, 0, 0),
+                "category": "exchange",
+            }
+        ]
+
+    async def fake_enrich_intel_item(item, llm_config=None, allow_env_fallback=True):
+        return {
+            **item,
+            "summary_ai": "Solana derivatives expansion is treated as a bullish exchange catalyst.",
+            "signal": "BULLISH",
+            "confidence": 0.86,
+            "reasoning": "New derivatives listings usually add liquidity and attention.",
+            "category": "exchange",
+            "symbols": ["SOLUSDT"],
+            "score": 0.86,
+        }
+
+    monkeypatch.setattr(
+        "app.modules.intel.service.fetch_external_intel_items",
+        fake_fetch_external_intel_items,
+    )
+    monkeypatch.setattr(
+        "app.modules.intel.service.enrich_intel_item",
+        fake_enrich_intel_item,
+    )
+
+    refresh = await client.post(
+        "/api/v1/intel/refresh",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert refresh.status_code == 200
+
+    feed = await client.get(
+        "/api/v1/intel/feed?symbol=SOLUSDT",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert feed.status_code == 200
+    item_id = feed.json()["data"]["items"][0]["id"]
+
+    settings_resp = await client.put(
+        "/api/v1/trade/settings",
+        json={
+            "llm_enabled": True,
+            "llm_provider": "OPENAI",
+            "llm_base_url": "https://api.minimaxi.com",
+            "llm_model": "MiniMax-M2.7",
+            "llm_api_key": "sk-test-12345678",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert settings_resp.status_code == 200
+
+    async def fake_stream_chat_with_intel_item(
+        db,
+        incoming_item_id,
+        question,
+        history=None,
+        *,
+        llm_config=None,
+        allow_env_fallback=True,
+        user_settings=None,
+    ):
+        del db, allow_env_fallback, user_settings
+        assert incoming_item_id == item_id
+        assert question == "这条情报对 SOL 的影响是什么？"
+        assert history == [{"role": "user", "content": "先给我一个简版结论"}]
+        assert llm_config is not None
+        assert llm_config["model"] == "MiniMax-M2.7"
+
+        async def generator():
+            yield {"type": "delta", "content": "偏多，"}
+            yield {"type": "delta", "content": "但更适合短中期观察。"}
+            yield {
+                "type": "done",
+                "reply": "偏多，但更适合短中期观察。",
+                "model": "MiniMax-M2.7",
+                "latency_ms": 321,
+            }
+
+        return generator()
+
+    monkeypatch.setattr(
+        "app.modules.intel.router.stream_chat_with_intel_item",
+        fake_stream_chat_with_intel_item,
+    )
+
+    response = await client.post(
+        f"/api/v1/intel/{item_id}/chat/stream",
+        json={
+            "question": "这条情报对 SOL 的影响是什么？",
+            "history": [{"role": "user", "content": "先给我一个简版结论"}],
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+
+    events = _parse_sse_events(response.text)
+    assert events == [
+        ("delta", '{"content": "偏多，"}'),
+        ("delta", '{"content": "但更适合短中期观察。"}'),
+        (
+            "done",
+            '{"reply": "偏多，但更适合短中期观察。", "model": "MiniMax-M2.7", "latency_ms": 321}',
+        ),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_intel_item_chat_reports_disabled_ai_more_clearly(client, monkeypatch):
     token = await _get_token(client)
 
@@ -403,9 +613,170 @@ async def test_enrich_intel_item_coerces_non_json_ai_response(monkeypatch):
 
     assert enriched["summary_ai"] == "地缘冲突与 ETF 资金流出共同压制风险偏好。"
     assert enriched["signal"] == "BEARISH"
-    assert enriched["confidence"] == 0.74
+    assert enriched["confidence"] == 0.53
     assert enriched["symbols"] == ["BTCUSDT"]
     assert enriched["reasoning"] == "战争升级和 ETF 流出意味着短线风险偏好下降。"
+
+
+@pytest.mark.asyncio
+async def test_fetch_binance_announcements_pages_large_limits(monkeypatch):
+    from app.modules.intel import service
+
+    requests: list[dict[str, int]] = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            del exc_type, exc, tb
+            return False
+
+        async def get(self, url, params=None):
+            assert url == service.BINANCE_ANNOUNCEMENTS_URL
+            assert params is not None
+            requests.append({"pageNo": params["pageNo"], "pageSize": params["pageSize"]})
+            assert params["pageSize"] <= service.BINANCE_ANNOUNCEMENTS_MAX_PAGE_SIZE
+
+            page_no = params["pageNo"]
+            articles = [
+                {
+                    "code": f"binance-{idx}",
+                    "title": f"Announcement {idx}",
+                    "releaseDate": f"2026-04-{idx:02d}T00:00:00",
+                }
+                for idx in range((page_no - 1) * 5 + 1, (page_no - 1) * 5 + params["pageSize"] + 1)
+            ]
+            return FakeResponse({"data": {"catalogs": [{"articles": articles}]}})
+
+    monkeypatch.setattr(service.httpx, "AsyncClient", FakeAsyncClient)
+
+    items = await service.fetch_binance_announcements(limit=8)
+
+    assert len(items) == 8
+    assert requests == [{"pageNo": 1, "pageSize": 5}, {"pageNo": 2, "pageSize": 3}]
+    assert items[0]["source_item_id"] == "binance-1"
+    assert items[-1]["source_item_id"] == "binance-8"
+
+
+@pytest.mark.asyncio
+async def test_fetch_fred_items_preserves_observation_date(monkeypatch):
+    from app.modules.intel import service
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "observations": [
+                    {"date": "2026-04-02", "value": "4.31"},
+                    {"date": "2026-04-01", "value": "4.33"},
+                ]
+            }
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            del exc_type, exc, tb
+            return False
+
+        async def get(self, url, params=None):
+            assert url == f"{service.FRED_BASE_URL}/series/observations"
+            assert params is not None
+            return FakeResponse()
+
+    monkeypatch.setattr(service.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(service.settings, "fred_api_key", "fred-test")
+    monkeypatch.setattr(
+        service,
+        "FRED_SERIES",
+        [{"id": "DGS10", "name": "10年期美债收益率", "unit": "%"}],
+    )
+
+    items = await service.fetch_fred_items()
+
+    assert len(items) == 1
+    assert items[0]["source_item_id"] == "DGS10_2026-04-02"
+    assert items[0]["published_at"] == datetime(2026, 4, 2, 0, 0, 0)
+    assert "2026-04-02" in items[0]["title"]
+
+
+@pytest.mark.asyncio
+async def test_upsert_intel_items_updates_source_item_id_when_matching_by_source_url(db_session):
+    from app.modules.intel.models import IntelItem
+    from app.modules.intel.service import upsert_intel_items
+
+    source_url = "https://fred.stlouisfed.org/series/DGS10"
+
+    await upsert_intel_items(
+        db_session,
+        [
+            {
+                "source_type": "external",
+                "source_name": "FRED",
+                "source_item_id": "DGS10_2026-03-30",
+                "title": "旧数据",
+                "source_url": source_url,
+                "content_raw": "旧数据",
+                "summary_ai": "旧摘要",
+                "signal": "NEUTRAL",
+                "confidence": 0.5,
+                "reasoning": "旧推理",
+                "category": "macro",
+                "published_at": datetime(2026, 3, 30, 0, 0, 0),
+                "symbols": [],
+            }
+        ],
+    )
+    await db_session.commit()
+
+    await upsert_intel_items(
+        db_session,
+        [
+            {
+                "source_type": "external",
+                "source_name": "FRED",
+                "source_item_id": "DGS10_2026-04-02",
+                "title": "新数据",
+                "source_url": source_url,
+                "content_raw": "新数据",
+                "summary_ai": "新摘要",
+                "signal": "NEUTRAL",
+                "confidence": 0.6,
+                "reasoning": "新推理",
+                "category": "macro",
+                "published_at": datetime(2026, 4, 2, 0, 0, 0),
+                "symbols": [],
+            }
+        ],
+    )
+    await db_session.commit()
+
+    rows = (await db_session.execute(select(IntelItem))).scalars().all()
+
+    assert len(rows) == 1
+    assert rows[0].source_item_id == "DGS10_2026-04-02"
+    assert rows[0].published_at == datetime(2026, 4, 2, 0, 0, 0)
+    assert rows[0].title == "新数据"
 
 
 @pytest.mark.asyncio

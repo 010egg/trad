@@ -13,6 +13,10 @@ export interface IntelItem {
   summary_ai: string
   signal: IntelSignal
   confidence: number
+  source_score: number
+  freshness_score: number
+  semantic_score: number
+  confirmation_count: number
   reasoning: string
   category: IntelCategory
   published_at: string
