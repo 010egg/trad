@@ -6,6 +6,7 @@ class IntelFeedItem(BaseModel):
     source_type: str
     source_name: str
     title: str
+    ai_title: str
     source_url: str
     summary_ai: str
     signal: str

@@ -65,6 +65,7 @@ async def test_refresh_and_filter_intel_feed(client, monkeypatch):
         if "SOL" in item["title"].upper():
             return {
                 **item,
+                "ai_title": "SOL 永续上线，交易热度升温",
                 "summary_ai": "Solana derivatives expansion is treated as a bullish exchange catalyst.",
                 "signal": "BULLISH",
                 "confidence": 0.86,
@@ -75,6 +76,7 @@ async def test_refresh_and_filter_intel_feed(client, monkeypatch):
             }
         return {
             **item,
+            "ai_title": "美国推进加密市场结构法案",
             "summary_ai": "Legislative progress is a regulatory catalyst with broad market impact.",
             "signal": "NEUTRAL",
             "confidence": 0.58,
@@ -108,6 +110,7 @@ async def test_refresh_and_filter_intel_feed(client, monkeypatch):
     assert feed.status_code == 200
     items = feed.json()["data"]["items"]
     assert len(items) == 1
+    assert items[0]["ai_title"] == "SOL 永续上线，交易热度升温"
     assert items[0]["symbols"] == ["SOLUSDT"]
     assert items[0]["signal"] == "BULLISH"
 
@@ -117,7 +120,300 @@ async def test_refresh_and_filter_intel_feed(client, monkeypatch):
     )
     assert detail.status_code == 200
     assert detail.json()["data"]["source_name"] == "Binance Announcements"
+    assert detail.json()["data"]["ai_title"] == "SOL 永续上线，交易热度升温"
 
+
+@pytest.mark.asyncio
+async def test_intel_feed_falls_back_to_title_when_ai_title_missing(client, monkeypatch):
+    token = await _get_token(client)
+
+    async def fake_fetch_external_intel_items():
+        return [
+            {
+                "source_type": "external",
+                "source_name": "Cointelegraph",
+                "source_item_id": "ct-fallback-1",
+                "title": "Bitcoin ETF inflows climb as market braces for CPI print",
+                "source_url": "https://example.com/ct-fallback-1",
+                "content_raw": "ETF demand improved ahead of a major macro catalyst.",
+                "published_at": __import__("datetime").datetime(2026, 3, 21, 0, 0, 0),
+                "category": "macro",
+            }
+        ]
+
+    async def fake_enrich_intel_item(item, llm_config=None, allow_env_fallback=True):
+        return {
+            **item,
+            "summary_ai": "ETF inflows are improving, but CPI remains the next validation point.",
+            "signal": "BULLISH",
+            "confidence": 0.66,
+            "reasoning": "Spot demand is constructive, but macro data can still swing sentiment.",
+            "category": "macro",
+            "symbols": ["BTCUSDT"],
+            "score": 0.66,
+        }
+
+    monkeypatch.setattr(
+        "app.modules.intel.service.fetch_external_intel_items",
+        fake_fetch_external_intel_items,
+    )
+    monkeypatch.setattr(
+        "app.modules.intel.service.enrich_intel_item",
+        fake_enrich_intel_item,
+    )
+
+    refresh = await client.post(
+        "/api/v1/intel/refresh",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert refresh.status_code == 200
+
+    feed = await client.get(
+        "/api/v1/intel/feed?symbol=BTCUSDT",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert feed.status_code == 200
+    item = feed.json()["data"]["items"][0]
+    assert item["ai_title"] == "Bitcoin ETF inflows climb as market braces for CPI print"
+
+
+@pytest.mark.asyncio
+async def test_refresh_backfills_existing_items_without_ai_title(client, db_session, monkeypatch):
+    from app.modules.intel.models import IntelItem
+
+    token = await _get_token(client)
+    settings_resp = await client.put(
+        "/api/v1/trade/settings",
+        json={
+            "llm_enabled": True,
+            "llm_provider": "OPENAI",
+            "llm_base_url": "https://api.minimaxi.com",
+            "llm_model": "MiniMax-M2.7",
+            "llm_api_key": "sk-test-12345678",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert settings_resp.status_code == 200
+
+    existing = IntelItem(
+        source_type="external",
+        source_name="CoinDesk",
+        source_item_id="coindesk-legacy-1",
+        title="One person holds the keys to $200 million of a project’s crypto. His co-founder says that has to end",
+        ai_title="One person holds the keys to $200 million of a project’s crypto. His co-founder says that has to end",
+        source_url="https://example.com/legacy-1",
+        content_raw="Co-founders Da Hongfei and Erik Zhang have conflicting restructuring plans.",
+        summary_ai="Co-founders Da Hongfei and Erik Zhang have conflicting restructuring plans.",
+        signal="NEUTRAL",
+        confidence=0.52,
+        reasoning="No directional catalyst was strong enough.",
+        category="project",
+        published_at=datetime(2026, 4, 19, 11, 0, 0),
+        ingested_at=datetime(2026, 4, 19, 11, 7, 0),
+        score=0.52,
+        source_score=0.85,
+        confirmation_count=1,
+        is_active=True,
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    async def fake_fetch_external_intel_items():
+        return []
+
+    async def fake_enrich_intel_item(item, llm_config=None, allow_env_fallback=True):
+        assert item["title"].startswith("One person holds the keys to $200 million")
+        return {
+            **item,
+            "ai_title": "Neo联合创始人治理分歧，$2亿资产单签风险",
+            "summary_ai": "Neo两位联合创始人围绕治理与资产控制爆发公开分歧，核心争议是约2亿美元加密资产仍由单一密钥控制。",
+            "signal": "BEARISH",
+            "confidence": 0.68,
+            "reasoning": "治理分裂叠加单签资金控制，属于典型的项目治理与托管风险。",
+            "category": "project",
+            "symbols": [],
+            "score": 0.68,
+        }
+
+    monkeypatch.setattr(
+        "app.modules.intel.service.fetch_external_intel_items",
+        fake_fetch_external_intel_items,
+    )
+    monkeypatch.setattr(
+        "app.modules.intel.service.enrich_intel_item",
+        fake_enrich_intel_item,
+    )
+
+    refresh = await client.post(
+        "/api/v1/intel/refresh",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert refresh.status_code == 200
+
+    feed = await client.get(
+        "/api/v1/intel/feed?q=keys",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert feed.status_code == 200
+    item = feed.json()["data"]["items"][0]
+    assert item["ai_title"] == "Neo联合创始人治理分歧，$2亿资产单签风险"
+    assert item["reasoning"] == "治理分裂叠加单签资金控制，属于典型的项目治理与托管风险。"
+
+
+@pytest.mark.asyncio
+async def test_refresh_backfills_existing_items_with_non_chinese_ai_title(client, db_session, monkeypatch):
+    from app.modules.intel.models import IntelItem
+
+    token = await _get_token(client)
+    settings_resp = await client.put(
+        "/api/v1/trade/settings",
+        json={
+            "llm_enabled": True,
+            "llm_provider": "OPENAI",
+            "llm_base_url": "https://api.minimaxi.com",
+            "llm_model": "MiniMax-M2.7",
+            "llm_api_key": "sk-test-12345678",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert settings_resp.status_code == 200
+
+    existing = IntelItem(
+        source_type="external",
+        source_name="CoinDesk",
+        source_item_id="coindesk-legacy-english-1",
+        title="Ethereum restaking demand grows as institutions test staking infrastructure",
+        ai_title="Ethereum restaking demand grows as institutions test staking infrastructure",
+        source_url="https://example.com/legacy-english-1",
+        content_raw="Institutional desks are expanding staking infrastructure pilots.",
+        summary_ai="Institutional desks are expanding staking infrastructure pilots.",
+        signal="NEUTRAL",
+        confidence=0.57,
+        reasoning="The setup is constructive but not yet a direct trading catalyst.",
+        category="onchain",
+        published_at=datetime(2026, 4, 19, 11, 0, 0),
+        ingested_at=datetime(2026, 4, 19, 11, 7, 0),
+        score=0.57,
+        source_score=0.85,
+        confirmation_count=1,
+        is_active=True,
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    async def fake_fetch_external_intel_items():
+        return []
+
+    async def fake_enrich_intel_item(item, llm_config=None, allow_env_fallback=True):
+        assert item["title"].startswith("Ethereum restaking demand grows")
+        return {
+            **item,
+            "ai_title": "机构测试质押基建，以太坊再质押需求升温",
+            "summary_ai": "机构开始测试以太坊质押基础设施，再质押需求有升温迹象，但仍需观察链上真实流入。",
+            "signal": "BULLISH",
+            "confidence": 0.71,
+            "reasoning": "机构试点说明基础设施需求在走强，但还没到全面定价阶段。",
+            "category": "onchain",
+            "symbols": ["ETHUSDT"],
+            "score": 0.71,
+        }
+
+    monkeypatch.setattr(
+        "app.modules.intel.service.fetch_external_intel_items",
+        fake_fetch_external_intel_items,
+    )
+    monkeypatch.setattr(
+        "app.modules.intel.service.enrich_intel_item",
+        fake_enrich_intel_item,
+    )
+
+    refresh = await client.post(
+        "/api/v1/intel/refresh",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert refresh.status_code == 200
+
+    feed = await client.get(
+        "/api/v1/intel/feed?q=restaking",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert feed.status_code == 200
+    item = feed.json()["data"]["items"][0]
+    assert item["ai_title"] == "机构测试质押基建，以太坊再质押需求升温"
+    assert item["symbols"] == ["ETHUSDT"]
+    assert item["signal"] == "BULLISH"
+
+
+@pytest.mark.asyncio
+async def test_refresh_single_intel_item_updates_ai_fields(client, db_session, monkeypatch):
+    from app.modules.intel.models import IntelItem
+
+    token = await _get_token(client)
+    settings_resp = await client.put(
+        "/api/v1/trade/settings",
+        json={
+            "llm_enabled": True,
+            "llm_provider": "OPENAI",
+            "llm_base_url": "https://api.minimaxi.com",
+            "llm_model": "MiniMax-M2.7",
+            "llm_api_key": "sk-test-12345678",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert settings_resp.status_code == 200
+
+    existing = IntelItem(
+        source_type="external",
+        source_name="Cointelegraph",
+        source_item_id="ct-single-refresh-1",
+        title="Bitcoin miners reduce reserves as hashprice stays under pressure",
+        ai_title="Bitcoin miners reduce reserves as hashprice stays under pressure",
+        source_url="https://example.com/single-refresh-1",
+        content_raw="Miner wallets are selling into weakness while margins remain thin.",
+        summary_ai="Miner wallets are selling into weakness while margins remain thin.",
+        signal="NEUTRAL",
+        confidence=0.49,
+        reasoning="Pressure exists but direction was not updated yet.",
+        category="macro",
+        published_at=datetime(2026, 4, 19, 9, 0, 0),
+        ingested_at=datetime(2026, 4, 19, 9, 5, 0),
+        score=0.49,
+        source_score=0.75,
+        confirmation_count=1,
+        is_active=True,
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    async def fake_enrich_intel_item(item, llm_config=None, allow_env_fallback=True):
+        assert item["source_item_id"] == "ct-single-refresh-1"
+        return {
+            **item,
+            "ai_title": "矿工持续减仓，比特币抛压仍在释放",
+            "summary_ai": "比特币矿工在 hashprice 承压时继续降低储备，短线可能继续提供卖压。",
+            "signal": "BEARISH",
+            "confidence": 0.73,
+            "reasoning": "矿工减仓通常会在弱势阶段放大上方抛压。",
+            "category": "macro",
+            "symbols": ["BTCUSDT"],
+            "score": 0.73,
+        }
+
+    monkeypatch.setattr(
+        "app.modules.intel.service.enrich_intel_item",
+        fake_enrich_intel_item,
+    )
+
+    response = await client.post(
+        f"/api/v1/intel/{existing.id}/refresh",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    item = response.json()["data"]
+    assert item["ai_title"] == "矿工持续减仓，比特币抛压仍在释放"
+    assert item["summary_ai"] == "比特币矿工在 hashprice 承压时继续降低储备，短线可能继续提供卖压。"
+    assert item["signal"] == "BEARISH"
+    assert item["symbols"] == ["BTCUSDT"]
 
 @pytest.mark.asyncio
 async def test_intel_item_chat_with_ai(client, monkeypatch):

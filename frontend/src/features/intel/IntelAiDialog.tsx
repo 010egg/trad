@@ -555,7 +555,7 @@ export function IntelAiDialog() {
                     全局助手已就绪
                   </div>
                   <p className="text-[12px] text-[#777] leading-relaxed">
-                    可直接提问市场、风险或交易观察。如需围绕特定情报深入讨论，前往情报页点击 <code className="text-blue-400 font-[var(--font-mono)]">AI</code> 按钮绑定上下文。
+                    可直接提问市场、风险或交易观察。如需围绕特定情报深入讨论，前往情报页选择对应卡片后点击 <code className="text-blue-400 font-[var(--font-mono)]">深入讨论</code>。
                   </p>
                   <button
                     type="button"

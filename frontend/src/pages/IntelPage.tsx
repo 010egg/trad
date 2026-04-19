@@ -1,6 +1,7 @@
 import { useDeferredValue, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { MainLayout } from '@/layouts/MainLayout'
+import { triggerIntelCardAiAction } from '@/features/intel/intelCardAiAction'
 import { useIntelStore, type IntelFilters, type IntelItem } from '@/stores/useIntelStore'
 import { useIntelAiStore } from '@/stores/useIntelAiStore'
 
@@ -59,6 +60,11 @@ function clampScore(value: number): number {
 
 function formatScore(value: number): string {
   return `${Math.round(clampScore(value) * 100)}%`
+}
+
+function isSameHeadline(primary: string, original: string) {
+  const normalize = (value: string) => value.trim().replace(/\s+/g, ' ')
+  return normalize(primary) === normalize(original)
 }
 
 function formatElapsed(from: string | null, to: string | null) {
@@ -149,11 +155,13 @@ export function IntelPage() {
   const fetchFilters = useIntelStore((state) => state.fetchFilters)
   const fetchFeed = useIntelStore((state) => state.fetchFeed)
   const refreshFeed = useIntelStore((state) => state.refreshFeed)
+  const refreshItem = useIntelStore((state) => state.refreshItem)
   const globalAiItem = useIntelAiStore((state) => state.item)
   const openAiWithItem = useIntelAiStore((state) => state.openWithItem)
   const setGlobalAiItem = useIntelAiStore((state) => state.setItem)
   const [queryInput, setQueryInput] = useState(filters.q)
   const [searchOpen, setSearchOpen] = useState(false)
+  const [refreshingItemId, setRefreshingItemId] = useState<string | null>(null)
   const searchRegionRef = useRef<HTMLDivElement | null>(null)
   const searchInputRef = useRef<HTMLInputElement | null>(null)
   const deferredQuery = useDeferredValue(queryInput.trim())
@@ -202,6 +210,15 @@ export function IntelPage() {
   const openAiDialog = (item: IntelItem) => {
     selectItem(item.id)
     openAiWithItem(item)
+  }
+
+  const handleRefreshItem = async (item: IntelItem) => {
+    await triggerIntelCardAiAction(item, {
+      openAiDialog,
+      refreshItem,
+      selectItem,
+      setRefreshingItemId,
+    })
   }
 
   const getSignalColor = (signal: string) => {
@@ -404,20 +421,29 @@ export function IntelPage() {
                             )}
                           </div>
                           <div className={`text-xs font-bold leading-snug line-clamp-2 ${active ? 'text-white' : 'text-[#aaa]'}`}>
-                            {item.title}
+                            {item.ai_title}
                           </div>
+                          {!isSameHeadline(item.ai_title, item.title) && (
+                            <div
+                              title={item.title}
+                              className={`mt-1 text-[10px] leading-snug line-clamp-2 ${active ? 'text-[#7d8590]' : 'text-[#666]'}`}
+                            >
+                              {item.title}
+                            </div>
+                          )}
                         </div>
 
                         <button
                           type="button"
                           onClick={(event) => {
                             event.stopPropagation()
-                            openAiDialog(item)
+                            void handleRefreshItem(item)
                           }}
+                          disabled={refreshingItemId === item.id}
                           className="shrink-0 self-start px-1.5 py-1 text-[9px] font-black font-[var(--font-mono)] text-blue-300 border border-blue-500/20 bg-blue-500/5 hover:bg-blue-500/10 transition-colors"
-                          title="对这条情报单独发起 AI 分析"
+                          title="对这条情报单独重新生成 AI 标题、摘要和打分"
                         >
-                          AI
+                          {refreshingItemId === item.id ? '...' : 'AI'}
                         </button>
                       </div>
                     )
@@ -465,9 +491,16 @@ export function IntelPage() {
                 </div>
 
                 {/* 标题 */}
-                <h1 className="text-2xl md:text-3xl font-black text-white leading-tight mb-8 tracking-tight">
-                  {selectedItem.title}
-                </h1>
+                <div className="mb-8">
+                  <h1 className="text-2xl md:text-3xl font-black text-white leading-tight tracking-tight">
+                    {selectedItem.ai_title}
+                  </h1>
+                  {!isSameHeadline(selectedItem.ai_title, selectedItem.title) && (
+                    <p className="mt-3 text-sm leading-relaxed text-[#7d8590] max-w-4xl">
+                      原始标题：{selectedItem.title}
+                    </p>
+                  )}
+                </div>
 
                 {/* 分析网格布局 */}
                 <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">

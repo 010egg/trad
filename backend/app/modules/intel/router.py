@@ -19,6 +19,7 @@ from app.modules.intel.service import (
     get_intel_detail,
     get_intel_filters,
     query_intel_feed,
+    refresh_intel_item_by_id,
     schedule_refresh_if_stale,
     stream_chat_with_intel_assistant,
     stream_chat_with_intel_item,
@@ -98,6 +99,24 @@ async def refresh(db: DB, user: User = Depends(get_current_user)):
         allow_env_fallback=not has_custom_llm_settings(trade_settings),
     )
     return _wrap(IntelRefreshResponse(**result).model_dump())
+
+
+@router.post("/{item_id}/refresh")
+async def refresh_item(item_id: str, db: DB, user: User = Depends(get_current_user)):
+    trade_service = TradeService(db, user.id)
+    trade_settings = await trade_service.get_trade_settings()
+    try:
+        data = await refresh_intel_item_by_id(
+            db,
+            item_id,
+            llm_config=build_user_llm_runtime_config(trade_settings),
+            allow_env_fallback=not has_custom_llm_settings(trade_settings),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if data is None:
+        raise HTTPException(status_code=404, detail="情报不存在")
+    return _wrap(data)
 
 
 @router.post("/chat")

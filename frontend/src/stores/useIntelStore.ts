@@ -9,6 +9,7 @@ export interface IntelItem {
   source_type: string
   source_name: string
   title: string
+  ai_title: string
   source_url: string
   summary_ai: string
   signal: IntelSignal
@@ -69,6 +70,7 @@ interface IntelState {
   fetchFilters: () => Promise<void>
   fetchFeed: (options?: { reset?: boolean; filters?: Partial<IntelFilters> }) => Promise<void>
   refreshFeed: () => Promise<void>
+  refreshItem: (itemId: string) => Promise<IntelItem | null>
 }
 
 const DEFAULT_FILTERS: IntelFilters = {
@@ -195,6 +197,25 @@ export const useIntelStore = create<IntelState>((set, get) => ({
       set({ error: detail })
     } finally {
       set({ refreshing: false })
+    }
+  },
+
+  refreshItem: async (itemId) => {
+    try {
+      set({ error: null })
+      const item: IntelItem = await api.post(`/intel/${itemId}/refresh`)
+
+      set((current) => ({
+        feed: current.feed.map((entry) => (entry.id === itemId ? item : entry)),
+        lastRefreshedAt: item.ingested_at || current.lastRefreshedAt,
+      }))
+
+      return item
+    } catch (error) {
+      console.error('Failed to refresh intel item:', error)
+      const detail = (error as any)?.response?.data?.detail || (error as any)?.message || '刷新单条情报失败，请稍后重试'
+      set({ error: detail })
+      return null
     }
   },
 }))

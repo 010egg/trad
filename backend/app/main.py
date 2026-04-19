@@ -64,6 +64,7 @@ async def lifespan(app: FastAPI):
             ("trade_settings", "llm_model", "VARCHAR(120) NOT NULL DEFAULT 'minimax'"),
             ("trade_settings", "llm_system_prompt", "TEXT NOT NULL DEFAULT ''"),
             ("trade_settings", "llm_api_key_enc", "TEXT"),
+            ("intel_items", "ai_title", "VARCHAR(240) NOT NULL DEFAULT ''"),
             ("intel_items", "source_score", "FLOAT NOT NULL DEFAULT 0.5"),
             ("intel_items", "confirmation_count", "INTEGER NOT NULL DEFAULT 1"),
         ]:

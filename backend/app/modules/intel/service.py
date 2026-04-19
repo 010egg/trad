@@ -42,6 +42,9 @@ FRED_SERIES = [
 INTEL_REFRESH_TTL = timedelta(minutes=5)
 INTEL_REFRESH_WAIT_SECONDS = 2.0
 INTEL_ENRICH_CONCURRENCY = 4
+INTEL_AI_BACKFILL_LIMIT = 20
+INTEL_AI_BACKFILL_SCAN_LIMIT = 100
+INTEL_AI_BACKFILL_LOOKBACK = timedelta(days=7)
 INTEL_CHAT_MAX_TOKENS = 1200
 INTEL_CHAT_REPLY_CHAR_LIMIT = 4000
 
@@ -192,6 +195,14 @@ def _strip_html(value: str | None) -> str:
     return cleaned.strip()
 
 
+def _contains_chinese(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
+def _normalize_headline(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip().lower()
+
+
 def _parse_published_at(value: str | int | float | None) -> datetime:
     if isinstance(value, (int, float)):
         return datetime.fromtimestamp(float(value) / 1000, tz=UTC).replace(tzinfo=None)
@@ -270,6 +281,7 @@ def _fallback_enrichment(item: dict[str, Any]) -> dict[str, Any]:
     signal, semantic_score, reasoning = _infer_signal(item)
     summary = _strip_html(str(item.get("content_raw") or "")) or str(item.get("title") or "")
     summary = summary[:280].strip()
+    ai_title = _derive_ai_title(str(item.get("title") or ""), summary)
 
     src_score = _source_score(str(item.get("source_name") or ""))
     fresh_score = _freshness_score(item.get("published_at"))
@@ -278,6 +290,7 @@ def _fallback_enrichment(item: dict[str, Any]) -> dict[str, Any]:
 
     return {
         **item,
+        "ai_title": ai_title,
         "summary_ai": summary,
         "signal": signal,
         "semantic_score": round(semantic_score, 2),
@@ -377,8 +390,9 @@ async def _coerce_summary_to_json(
                     "role": "user",
                     "content": (
                         "请把下面这段市场情报分析内容转换成严格 JSON，且只能返回一个 JSON 对象，不要输出任何额外文字。\n"
-                        "JSON keys 必须且只能是: summary, signal, confidence, reasoning, symbols, category。\n"
+                        "JSON keys 必须且只能是: ai_title, summary, signal, confidence, reasoning, symbols, category。\n"
                         "约束:\n"
+                        "- ai_title: 用中文写一个适合卡片展示的短标题，尽量不超过 24 个字\n"
                         "- signal 只能是 BULLISH, BEARISH, NEUTRAL 之一\n"
                         "- category 只能是 macro, onchain, exchange, regulation, project 之一\n"
                         "- confidence 必须是 0 到 1 之间的数字\n"
@@ -404,6 +418,67 @@ def _clean_ai_text(value: str) -> str:
     text = text.replace("\r\n", "\n")
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def _derive_ai_title(
+    source_title: str,
+    summary: str = "",
+    candidate: str = "",
+) -> str:
+    normalized_candidate = re.sub(r"\s+", " ", (candidate or "").strip()).strip(" -:：;；,.，。")
+    normalized_source = re.sub(r"\s+", " ", (source_title or "").strip()).strip(" -:：;；,.，。")
+    summary_line = (summary or "").strip().splitlines()[0].strip() if summary else ""
+    normalized_summary = re.sub(r"\s+", " ", summary_line).strip(" -:：;；,.，。")
+
+    text = ""
+    if normalized_candidate and _contains_chinese(normalized_candidate):
+        text = normalized_candidate
+    elif normalized_summary and _contains_chinese(normalized_summary):
+        text = normalized_summary
+    elif normalized_candidate:
+        text = normalized_candidate
+    elif normalized_source:
+        text = normalized_source
+    else:
+        text = normalized_summary
+
+    if not text:
+        return "未命名情报"
+    return text
+
+
+def _needs_ai_title_backfill(source_title: str, ai_title: str) -> bool:
+    normalized_ai_title = _normalize_headline(ai_title)
+    normalized_source_title = _normalize_headline(source_title)
+    if not normalized_ai_title:
+        return True
+    if normalized_ai_title == normalized_source_title:
+        return True
+    return not _contains_chinese(ai_title)
+
+
+def _should_backfill_intel_item(item: IntelItem) -> bool:
+    return _needs_ai_title_backfill(item.title or "", item.ai_title or "")
+
+
+def _serialize_item_for_ai_refresh(item: IntelItem) -> dict[str, Any]:
+    return {
+        "source_type": item.source_type,
+        "source_name": item.source_name,
+        "source_item_id": item.source_item_id,
+        "title": item.title,
+        "ai_title": item.ai_title,
+        "source_url": item.source_url,
+        "content_raw": item.content_raw,
+        "summary_ai": item.summary_ai,
+        "signal": item.signal,
+        "confidence": item.confidence,
+        "reasoning": item.reasoning,
+        "category": item.category,
+        "published_at": item.published_at,
+        "symbols": [link.symbol for link in item.symbol_links],
+        "source_score": item.source_score,
+    }
 
 
 def _build_chat_messages(runtime_config: dict[str, str], prompt: str) -> list[dict[str, str]]:
@@ -874,8 +949,9 @@ def _build_intel_chat_payload(item: IntelItem, question: str, history: list[dict
 def _build_intel_summary_prompt(prompt_payload: dict[str, Any]) -> str:
     return (
         "请分析下面这条加密市场情报，并严格返回一个 JSON 对象，不要输出任何 JSON 之外的文字。\n"
-        "JSON keys 必须且只能是: summary, signal, confidence, reasoning, symbols, category。\n"
+        "JSON keys 必须且只能是: ai_title, summary, signal, confidence, reasoning, symbols, category。\n"
         "字段约束:\n"
+        "- ai_title: 用中文写一个适合情报卡片展示的短标题，尽量不超过 24 个字\n"
         "- summary: 简洁摘要\n"
         "- signal: 只能是 BULLISH, BEARISH, NEUTRAL 之一\n"
         "- confidence: 0 到 1 之间的数字\n"
@@ -1187,9 +1263,15 @@ async def enrich_intel_item(
 
     summary = str(parsed.get("summary") or enriched["summary_ai"]).strip() or enriched["summary_ai"]
     reasoning = str(parsed.get("reasoning") or enriched["reasoning"]).strip() or enriched["reasoning"]
+    ai_title = _derive_ai_title(
+        str(item.get("title") or ""),
+        summary,
+        str(parsed.get("ai_title") or enriched.get("ai_title") or ""),
+    )
 
     return {
         **enriched,
+        "ai_title": ai_title,
         "summary_ai": summary[:480],
         "signal": signal,
         "semantic_score": round(semantic_score, 2),
@@ -1448,6 +1530,7 @@ async def upsert_intel_items(db: AsyncSession, items: list[dict[str, Any]]) -> d
                 source_name=str(payload.get("source_name") or "Unknown"),
                 source_item_id=str(payload.get("source_item_id") or "") or None,
                 title=str(payload.get("title") or ""),
+                ai_title=str(payload.get("ai_title") or ""),
                 source_url=str(payload.get("source_url") or ""),
                 content_raw=str(payload.get("content_raw") or ""),
                 summary_ai=str(payload.get("summary_ai") or ""),
@@ -1470,6 +1553,7 @@ async def upsert_intel_items(db: AsyncSession, items: list[dict[str, Any]]) -> d
             existing.source_name = str(payload.get("source_name") or existing.source_name)
             existing.source_item_id = str(payload.get("source_item_id") or "") or existing.source_item_id
             existing.title = str(payload.get("title") or existing.title)
+            existing.ai_title = str(payload.get("ai_title") or existing.ai_title)
             existing.source_url = str(payload.get("source_url") or existing.source_url)
             existing.content_raw = str(payload.get("content_raw") or existing.content_raw)
             existing.summary_ai = str(payload.get("summary_ai") or existing.summary_ai)
@@ -1492,6 +1576,119 @@ async def upsert_intel_items(db: AsyncSession, items: list[dict[str, Any]]) -> d
         await _sync_item_symbols(db, existing, payload.get("symbols") or [])
 
     return {"fetched": len(items), "created": created, "updated": updated}
+
+
+async def backfill_recent_intel_items(
+    db: AsyncSession,
+    *,
+    llm_config: dict[str, str] | None = None,
+    allow_env_fallback: bool = True,
+) -> int:
+    runtime_config = _resolve_runtime_config(
+        llm_config,
+        allow_env_fallback=allow_env_fallback,
+    )
+    if runtime_config is None:
+        return 0
+
+    horizon = _utc_now_naive() - INTEL_AI_BACKFILL_LOOKBACK
+    stmt = (
+        select(IntelItem)
+        .where(
+            IntelItem.is_active.is_(True),
+            IntelItem.published_at >= horizon,
+        )
+        .options(selectinload(IntelItem.symbol_links))
+        .order_by(IntelItem.ingested_at.desc(), IntelItem.id.desc())
+        .limit(INTEL_AI_BACKFILL_SCAN_LIMIT)
+    )
+    candidates = (await db.execute(stmt)).scalars().unique().all()
+    items = [item for item in candidates if _should_backfill_intel_item(item)][:INTEL_AI_BACKFILL_LIMIT]
+
+    updated = 0
+    for item in items:
+        payload = _serialize_item_for_ai_refresh(item)
+        enriched = await enrich_intel_item(
+            payload,
+            llm_config=runtime_config,
+            allow_env_fallback=False,
+        )
+
+        next_ai_title = str(enriched.get("ai_title") or item.ai_title or "").strip()
+        next_summary = str(enriched.get("summary_ai") or item.summary_ai or "").strip()
+        next_reasoning = str(enriched.get("reasoning") or item.reasoning or "").strip()
+
+        if (
+            next_ai_title == (item.ai_title or "")
+            and next_summary == (item.summary_ai or "")
+            and next_reasoning == (item.reasoning or "")
+        ):
+            continue
+
+        item.ai_title = next_ai_title or item.ai_title
+        item.summary_ai = next_summary or item.summary_ai
+        item.reasoning = next_reasoning or item.reasoning
+        item.signal = str(enriched.get("signal") or item.signal)
+        item.category = str(enriched.get("category") or item.category)
+        item.confidence = float(enriched.get("confidence") or item.confidence or 0.0)
+        item.score = float(enriched.get("score") or item.score or 0.0)
+        item.source_score = float(enriched.get("source_score") or item.source_score or 0.5)
+        await _sync_item_symbols(db, item, enriched.get("symbols") or [])
+        updated += 1
+
+    return updated
+
+
+async def refresh_intel_item_by_id(
+    db: AsyncSession,
+    item_id: str,
+    *,
+    llm_config: dict[str, str] | None = None,
+    allow_env_fallback: bool = True,
+) -> dict[str, Any] | None:
+    runtime_config = _resolve_runtime_config(
+        llm_config,
+        allow_env_fallback=allow_env_fallback,
+    )
+    if runtime_config is None:
+        raise RuntimeError(
+            describe_llm_unavailable_reason(
+                llm_config=llm_config,
+                allow_env_fallback=allow_env_fallback,
+            )
+        )
+
+    stmt = (
+        select(IntelItem)
+        .where(IntelItem.id == item_id, IntelItem.is_active.is_(True))
+        .options(selectinload(IntelItem.symbol_links))
+    )
+    item = (await db.execute(stmt)).scalar_one_or_none()
+    if item is None:
+        return None
+
+    enriched = await enrich_intel_item(
+        _serialize_item_for_ai_refresh(item),
+        llm_config=runtime_config,
+        allow_env_fallback=False,
+    )
+
+    next_ai_title = str(enriched.get("ai_title") or item.ai_title or "").strip()
+    next_summary = str(enriched.get("summary_ai") or item.summary_ai or "").strip()
+    next_reasoning = str(enriched.get("reasoning") or item.reasoning or "").strip()
+
+    item.ai_title = next_ai_title or item.ai_title
+    item.summary_ai = next_summary or item.summary_ai
+    item.reasoning = next_reasoning or item.reasoning
+    item.signal = str(enriched.get("signal") or item.signal)
+    item.category = str(enriched.get("category") or item.category)
+    item.confidence = float(enriched.get("confidence") or item.confidence or 0.0)
+    item.score = float(enriched.get("score") or item.score or 0.0)
+    item.source_score = float(enriched.get("source_score") or item.source_score or 0.5)
+    await _sync_item_symbols(db, item, enriched.get("symbols") or [])
+    await db.commit()
+    await db.refresh(item, attribute_names=["symbol_links"])
+    return serialize_intel_item(item)
 
 
 async def get_last_refresh_at(db: AsyncSession) -> datetime | None:
@@ -1523,6 +1720,14 @@ async def refresh_intel_feed(
                 "last_refreshed_at": _datetime_to_iso(last_refreshed_at),
             }
 
+        backfilled = await backfill_recent_intel_items(
+            db,
+            llm_config=llm_config,
+            allow_env_fallback=allow_env_fallback,
+        )
+        if backfilled:
+            await db.commit()
+
         external_items = await fetch_external_intel_items()
 
         semaphore = asyncio.Semaphore(INTEL_ENRICH_CONCURRENCY)
@@ -1537,6 +1742,7 @@ async def refresh_intel_feed(
 
         enriched_items = await asyncio.gather(*[_enrich(item) for item in external_items])
         result = await upsert_intel_items(db, enriched_items)
+        result["updated"] += backfilled
         await db.commit()
         last_refreshed_at = await get_last_refresh_at(db)
         return {**result, "last_refreshed_at": _datetime_to_iso(last_refreshed_at)}
@@ -1674,6 +1880,7 @@ def serialize_intel_item(item: IntelItem) -> dict[str, Any]:
     confidence = round(float(item.confidence or 0.0), 2)
     source_score = round(float(item.source_score or 0.5), 2)
     confirmation_count = int(item.confirmation_count or 1)
+    ai_title = _derive_ai_title(item.title, item.summary_ai, item.ai_title or "")
     freshness_score = round(
         _freshness_score(item.published_at, reference_at=item.ingested_at),
         2,
@@ -1690,6 +1897,7 @@ def serialize_intel_item(item: IntelItem) -> dict[str, Any]:
         "source_type": item.source_type,
         "source_name": item.source_name,
         "title": item.title,
+        "ai_title": ai_title,
         "source_url": item.source_url,
         "summary_ai": item.summary_ai,
         "signal": item.signal,
@@ -1729,6 +1937,7 @@ async def query_intel_feed(
         like = f"%{q.strip()}%"
         stmt = stmt.where(
             or_(
+                IntelItem.ai_title.ilike(like),
                 IntelItem.title.ilike(like),
                 IntelItem.summary_ai.ilike(like),
                 IntelItem.content_raw.ilike(like),

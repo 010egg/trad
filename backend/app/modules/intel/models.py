@@ -15,6 +15,7 @@ class IntelItem(Base):
     source_name: Mapped[str] = mapped_column(String(120), index=True)
     source_item_id: Mapped[str | None] = mapped_column(String(255), index=True, nullable=True)
     title: Mapped[str] = mapped_column(String(500))
+    ai_title: Mapped[str] = mapped_column(String(240), default="")
     source_url: Mapped[str] = mapped_column(String(1000), default="")
     content_raw: Mapped[str] = mapped_column(Text, default="")
     summary_ai: Mapped[str] = mapped_column(Text, default="")
@@ -49,4 +50,3 @@ class IntelItemSymbol(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     item: Mapped[IntelItem] = relationship(back_populates="symbol_links")
-
