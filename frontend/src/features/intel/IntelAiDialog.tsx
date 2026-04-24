@@ -2,6 +2,7 @@ import { startTransition, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { getIntelDisplayContent, getIntelDisplayTitle } from '@/features/intel/intelDisplay'
 import { API_BASE_URL, buildApiHeaders, handleApiUnauthorized } from '@/lib/api'
 import { useIntelAiStore } from '@/stores/useIntelAiStore'
 
@@ -316,6 +317,8 @@ export function IntelAiDialog() {
   const abortRef = useRef<AbortController | null>(null)
   const sessionKey = item?.id || GLOBAL_SESSION_KEY
   const quickPrompts = item ? ITEM_QUICK_PROMPTS : GLOBAL_QUICK_PROMPTS
+  const displayTitle = item ? getIntelDisplayTitle(item) : ''
+  const displayContent = item ? getIntelDisplayContent(item) : ''
 
   const messages = useMemo(() => {
     return sessions[sessionKey] || []
@@ -535,7 +538,12 @@ export function IntelAiDialog() {
                   </span>
                 ))}
               </div>
-              <p className="line-clamp-2 text-[12px] font-bold text-[#ccc] leading-snug">{item.title}</p>
+              <p className="line-clamp-2 text-[12px] font-bold text-[#ccc] leading-snug">{displayTitle}</p>
+              {displayContent && displayContent !== displayTitle && (
+                <p className="mt-2 line-clamp-3 text-[11px] leading-relaxed text-[#7d8590]">
+                  {displayContent}
+                </p>
+              )}
             </div>
           ) : (
             <div className="shrink-0 border-b border-[#222] px-4 py-3 bg-[#0A0A0A]">

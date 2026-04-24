@@ -10,8 +10,10 @@ export interface IntelItem {
   source_name: string
   title: string
   ai_title: string
+  display_title?: string
   source_url: string
   summary_ai: string
+  display_content?: string
   signal: IntelSignal
   confidence: number
   source_score: number
@@ -33,6 +35,17 @@ export interface IntelFilters {
   min_confidence: number
 }
 
+export interface IntelTodaySignalStats {
+  date: string
+  total_count: number
+  bullish_count: number
+  bearish_count: number
+  neutral_count: number
+  bullish_ratio: number
+  bearish_ratio: number
+  neutral_ratio: number
+}
+
 interface IntelFilterOptions {
   symbols: string[]
   categories: string[]
@@ -42,6 +55,8 @@ interface IntelFilterOptions {
 interface IntelFeedPayload {
   items: IntelItem[]
   next_cursor: string | null
+  total_count: number
+  today_signal_stats: IntelTodaySignalStats
   stale: boolean
   last_refreshed_at: string | null
 }
@@ -60,6 +75,8 @@ interface IntelState {
   filters: IntelFilters
   filterOptions: IntelFilterOptions
   nextCursor: string | null
+  totalCount: number
+  todaySignalStats: IntelTodaySignalStats | null
   stale: boolean
   lastRefreshedAt: string | null
   loading: boolean
@@ -96,6 +113,9 @@ function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms))
 }
 
+let latestFeedRequestId = 0
+let feedAbortController: AbortController | null = null
+
 export const useIntelStore = create<IntelState>((set, get) => ({
   feed: [],
   selectedId: null,
@@ -106,6 +126,8 @@ export const useIntelStore = create<IntelState>((set, get) => ({
     signals: [],
   },
   nextCursor: null,
+  totalCount: 0,
+  todaySignalStats: null,
   stale: false,
   lastRefreshedAt: null,
   loading: false,
@@ -133,6 +155,10 @@ export const useIntelStore = create<IntelState>((set, get) => ({
   fetchFeed: async (options) => {
     const state = get()
     const reset = options?.reset ?? true
+    const requestId = ++latestFeedRequestId
+    feedAbortController?.abort()
+    const abortController = new AbortController()
+    feedAbortController = abortController
     const nextFilters = {
       ...state.filters,
       ...(options?.filters || {}),
@@ -148,7 +174,12 @@ export const useIntelStore = create<IntelState>((set, get) => ({
 
       const data: IntelFeedPayload = await api.get('/intel/feed', {
         params: buildParams(nextFilters, reset ? null : state.nextCursor),
+        signal: abortController.signal,
       })
+
+      if (requestId !== latestFeedRequestId) {
+        return
+      }
 
       set((current) => {
         const nextFeed = reset ? data.items || [] : [...current.feed, ...(data.items || [])]
@@ -156,6 +187,8 @@ export const useIntelStore = create<IntelState>((set, get) => ({
         return {
           feed: nextFeed,
           nextCursor: data.next_cursor || null,
+          totalCount: data.total_count || 0,
+          todaySignalStats: data.today_signal_stats || null,
           stale: !!data.stale,
           lastRefreshedAt: data.last_refreshed_at || null,
           loading: false,
@@ -164,12 +197,20 @@ export const useIntelStore = create<IntelState>((set, get) => ({
         }
       })
     } catch (error) {
+      if (requestId !== latestFeedRequestId) {
+        return
+      }
+
       console.error('Failed to fetch intel feed:', error)
       set({
         loading: false,
         loadingMore: false,
         error: '加载情报失败，请稍后重试',
       })
+    } finally {
+      if (requestId === latestFeedRequestId) {
+        feedAbortController = null
+      }
     }
   },
 

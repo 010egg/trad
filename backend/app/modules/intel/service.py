@@ -13,7 +13,7 @@ from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
 import httpx
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -445,6 +445,22 @@ def _derive_ai_title(
     if not text:
         return "未命名情报"
     return text
+
+
+def _derive_display_content(
+    summary_ai: str = "",
+    content_raw: str = "",
+    title: str = "",
+) -> str:
+    normalized_summary = _strip_html(summary_ai)
+    if normalized_summary:
+        return normalized_summary
+
+    normalized_content = _strip_html(content_raw)
+    if normalized_content:
+        return normalized_content
+
+    return _strip_html(title)
 
 
 def _needs_ai_title_backfill(source_title: str, ai_title: str) -> bool:
@@ -1881,6 +1897,7 @@ def serialize_intel_item(item: IntelItem) -> dict[str, Any]:
     source_score = round(float(item.source_score or 0.5), 2)
     confirmation_count = int(item.confirmation_count or 1)
     ai_title = _derive_ai_title(item.title, item.summary_ai, item.ai_title or "")
+    display_content = _derive_display_content(item.summary_ai or "", item.content_raw or "", item.title or "")
     freshness_score = round(
         _freshness_score(item.published_at, reference_at=item.ingested_at),
         2,
@@ -1898,8 +1915,10 @@ def serialize_intel_item(item: IntelItem) -> dict[str, Any]:
         "source_name": item.source_name,
         "title": item.title,
         "ai_title": ai_title,
+        "display_title": ai_title,
         "source_url": item.source_url,
         "summary_ai": item.summary_ai,
+        "display_content": display_content,
         "signal": item.signal,
         "confidence": confidence,
         "source_score": source_score,
@@ -1925,26 +1944,57 @@ async def query_intel_feed(
     q: str | None = None,
     min_confidence: float | None = None,
 ) -> dict[str, Any]:
-    stmt = select(IntelItem).where(IntelItem.is_active.is_(True))
+    def apply_filters(stmt):
+        stmt = stmt.where(IntelItem.is_active.is_(True))
 
-    if symbol:
-        stmt = stmt.join(IntelItemSymbol).where(IntelItemSymbol.symbol == symbol.upper())
-    if category:
-        stmt = stmt.where(IntelItem.category == category.lower())
-    if signal:
-        stmt = stmt.where(IntelItem.signal == signal.upper())
-    if q:
-        like = f"%{q.strip()}%"
-        stmt = stmt.where(
-            or_(
-                IntelItem.ai_title.ilike(like),
-                IntelItem.title.ilike(like),
-                IntelItem.summary_ai.ilike(like),
-                IntelItem.content_raw.ilike(like),
+        if symbol:
+            stmt = stmt.join(IntelItemSymbol).where(IntelItemSymbol.symbol == symbol.upper())
+        if category:
+            stmt = stmt.where(IntelItem.category == category.lower())
+        if signal:
+            stmt = stmt.where(IntelItem.signal == signal.upper())
+        if q:
+            like = f"%{q.strip()}%"
+            stmt = stmt.where(
+                or_(
+                    IntelItem.ai_title.ilike(like),
+                    IntelItem.title.ilike(like),
+                    IntelItem.summary_ai.ilike(like),
+                    IntelItem.content_raw.ilike(like),
+                )
             )
+        if min_confidence is not None:
+            stmt = stmt.where(IntelItem.confidence >= min_confidence)
+        return stmt
+
+    stmt = apply_filters(select(IntelItem))
+
+    total_count_stmt = apply_filters(select(func.count()))
+    total_count = int((await db.execute(total_count_stmt)).scalar_one() or 0)
+
+    today_start = _utc_now_naive().replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow_start = today_start + timedelta(days=1)
+    today_stats_stmt = apply_filters(
+        select(
+            func.count().label("total_count"),
+            func.sum(case((IntelItem.signal == "BULLISH", 1), else_=0)).label("bullish_count"),
+            func.sum(case((IntelItem.signal == "BEARISH", 1), else_=0)).label("bearish_count"),
+            func.sum(case((IntelItem.signal == "NEUTRAL", 1), else_=0)).label("neutral_count"),
         )
-    if min_confidence is not None:
-        stmt = stmt.where(IntelItem.confidence >= min_confidence)
+    ).where(
+        IntelItem.published_at >= today_start,
+        IntelItem.published_at < tomorrow_start,
+    )
+    today_stats_row = (await db.execute(today_stats_stmt)).one()
+    today_total_count = int(today_stats_row.total_count or 0)
+    bullish_count = int(today_stats_row.bullish_count or 0)
+    bearish_count = int(today_stats_row.bearish_count or 0)
+    neutral_count = int(today_stats_row.neutral_count or 0)
+
+    def ratio(count: int) -> float:
+        if today_total_count == 0:
+            return 0.0
+        return round(count / today_total_count, 4)
 
     cursor_filter = _cursor_clause(cursor)
     if cursor_filter is not None:
@@ -1968,6 +2018,17 @@ async def query_intel_feed(
     return {
         "items": [serialize_intel_item(item) for item in items],
         "next_cursor": next_cursor,
+        "total_count": total_count,
+        "today_signal_stats": {
+            "date": today_start.date().isoformat(),
+            "total_count": today_total_count,
+            "bullish_count": bullish_count,
+            "bearish_count": bearish_count,
+            "neutral_count": neutral_count,
+            "bullish_ratio": ratio(bullish_count),
+            "bearish_ratio": ratio(bearish_count),
+            "neutral_ratio": ratio(neutral_count),
+        },
         "stale": await is_intel_stale(db),
         "last_refreshed_at": _datetime_to_iso(await get_last_refresh_at(db)),
     }

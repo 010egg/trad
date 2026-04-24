@@ -1,14 +1,27 @@
 from pydantic import BaseModel, Field
 
 
+class IntelTodaySignalStats(BaseModel):
+    date: str
+    total_count: int
+    bullish_count: int
+    bearish_count: int
+    neutral_count: int
+    bullish_ratio: float
+    bearish_ratio: float
+    neutral_ratio: float
+
+
 class IntelFeedItem(BaseModel):
     id: str
     source_type: str
     source_name: str
     title: str
     ai_title: str
+    display_title: str
     source_url: str
     summary_ai: str
+    display_content: str
     signal: str
     confidence: float
     source_score: float = 0.5
@@ -25,6 +38,8 @@ class IntelFeedItem(BaseModel):
 class IntelFeedResponse(BaseModel):
     items: list[IntelFeedItem]
     next_cursor: str | None = None
+    total_count: int = 0
+    today_signal_stats: IntelTodaySignalStats
     stale: bool
     last_refreshed_at: str | None = None
 

@@ -33,6 +33,70 @@ def _parse_sse_events(payload: str) -> list[tuple[str, str]]:
     return events
 
 
+def test_serialize_intel_item_prefers_ai_fields_for_display():
+    from app.modules.intel.models import IntelItem, IntelItemSymbol
+    from app.modules.intel.service import serialize_intel_item
+
+    item = IntelItem(
+        source_type="external",
+        source_name="CoinDesk",
+        source_item_id="display-ai-1",
+        title="Original English title",
+        ai_title="AI 中文标题",
+        source_url="https://example.com/display-ai-1",
+        content_raw="Original raw content",
+        summary_ai="AI 中文摘要",
+        signal="BULLISH",
+        confidence=0.72,
+        reasoning="reasoning",
+        category="macro",
+        published_at=datetime(2026, 4, 21, 10, 0, 0),
+        ingested_at=datetime(2026, 4, 21, 10, 5, 0),
+        score=0.72,
+        source_score=0.81,
+        confirmation_count=2,
+        is_active=True,
+    )
+    item.symbol_links = [IntelItemSymbol(symbol="BTCUSDT")]
+
+    payload = serialize_intel_item(item)
+
+    assert payload["display_title"] == "AI 中文标题"
+    assert payload["display_content"] == "AI 中文摘要"
+    assert payload["title"] == "Original English title"
+
+
+def test_serialize_intel_item_falls_back_to_raw_content_when_ai_content_missing():
+    from app.modules.intel.models import IntelItem
+    from app.modules.intel.service import serialize_intel_item
+
+    item = IntelItem(
+        source_type="external",
+        source_name="CoinDesk",
+        source_item_id="display-fallback-1",
+        title="Original English title",
+        ai_title="",
+        source_url="https://example.com/display-fallback-1",
+        content_raw="<p>Original raw content</p>",
+        summary_ai="",
+        signal="NEUTRAL",
+        confidence=0.51,
+        reasoning="reasoning",
+        category="macro",
+        published_at=datetime(2026, 4, 21, 10, 0, 0),
+        ingested_at=datetime(2026, 4, 21, 10, 5, 0),
+        score=0.51,
+        source_score=0.7,
+        confirmation_count=1,
+        is_active=True,
+    )
+
+    payload = serialize_intel_item(item)
+
+    assert payload["display_title"] == "Original English title"
+    assert payload["display_content"] == "Original raw content"
+
+
 @pytest.mark.asyncio
 async def test_refresh_and_filter_intel_feed(client, monkeypatch):
     token = await _get_token(client)
@@ -1210,6 +1274,120 @@ async def test_query_intel_feed_orders_and_paginates_by_ingested_at(db_session):
 
     assert [item["id"] for item in second_page["items"]] == ["intel-c"]
     assert second_page["next_cursor"] is None
+
+
+@pytest.mark.asyncio
+async def test_query_intel_feed_returns_total_count_and_today_signal_stats(db_session, monkeypatch):
+    from app.modules.intel.models import IntelItem
+    from app.modules.intel.service import query_intel_feed
+
+    fixed_now = datetime(2026, 4, 22, 12, 0, 0)
+    monkeypatch.setattr("app.modules.intel.service._utc_now_naive", lambda: fixed_now)
+
+    db_session.add_all(
+        [
+            IntelItem(
+                id="today-bull",
+                source_type="external",
+                source_name="CoinDesk",
+                source_item_id="today-bull",
+                title="today bull",
+                ai_title="today bull",
+                source_url="https://example.com/today-bull",
+                content_raw="today bull",
+                summary_ai="today bull",
+                signal="BULLISH",
+                confidence=0.7,
+                reasoning="today bull",
+                category="macro",
+                published_at=datetime(2026, 4, 22, 1, 0, 0),
+                ingested_at=datetime(2026, 4, 22, 1, 5, 0),
+                score=0.7,
+                source_score=0.7,
+                confirmation_count=1,
+                is_active=True,
+            ),
+            IntelItem(
+                id="today-bear",
+                source_type="external",
+                source_name="CoinDesk",
+                source_item_id="today-bear",
+                title="today bear",
+                ai_title="today bear",
+                source_url="https://example.com/today-bear",
+                content_raw="today bear",
+                summary_ai="today bear",
+                signal="BEARISH",
+                confidence=0.7,
+                reasoning="today bear",
+                category="macro",
+                published_at=datetime(2026, 4, 22, 2, 0, 0),
+                ingested_at=datetime(2026, 4, 22, 2, 5, 0),
+                score=0.7,
+                source_score=0.7,
+                confirmation_count=1,
+                is_active=True,
+            ),
+            IntelItem(
+                id="today-neutral",
+                source_type="external",
+                source_name="CoinDesk",
+                source_item_id="today-neutral",
+                title="today neutral",
+                ai_title="today neutral",
+                source_url="https://example.com/today-neutral",
+                content_raw="today neutral",
+                summary_ai="today neutral",
+                signal="NEUTRAL",
+                confidence=0.7,
+                reasoning="today neutral",
+                category="macro",
+                published_at=datetime(2026, 4, 22, 3, 0, 0),
+                ingested_at=datetime(2026, 4, 22, 3, 5, 0),
+                score=0.7,
+                source_score=0.7,
+                confirmation_count=1,
+                is_active=True,
+            ),
+            IntelItem(
+                id="yesterday-bull",
+                source_type="external",
+                source_name="CoinDesk",
+                source_item_id="yesterday-bull",
+                title="yesterday bull",
+                ai_title="yesterday bull",
+                source_url="https://example.com/yesterday-bull",
+                content_raw="yesterday bull",
+                summary_ai="yesterday bull",
+                signal="BULLISH",
+                confidence=0.7,
+                reasoning="yesterday bull",
+                category="macro",
+                published_at=datetime(2026, 4, 21, 23, 0, 0),
+                ingested_at=datetime(2026, 4, 21, 23, 5, 0),
+                score=0.7,
+                source_score=0.7,
+                confirmation_count=1,
+                is_active=True,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    result = await query_intel_feed(db_session, limit=2)
+
+    assert len(result["items"]) == 2
+    assert result["total_count"] == 4
+    assert result["today_signal_stats"] == {
+        "date": "2026-04-22",
+        "total_count": 3,
+        "bullish_count": 1,
+        "bearish_count": 1,
+        "neutral_count": 1,
+        "bullish_ratio": pytest.approx(1 / 3, rel=1e-4),
+        "bearish_ratio": pytest.approx(1 / 3, rel=1e-4),
+        "neutral_ratio": pytest.approx(1 / 3, rel=1e-4),
+    }
 
 
 @pytest.mark.asyncio

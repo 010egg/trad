@@ -2,6 +2,7 @@ import { useDeferredValue, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { MainLayout } from '@/layouts/MainLayout'
 import { triggerIntelCardAiAction } from '@/features/intel/intelCardAiAction'
+import { getIntelDisplayContent, getIntelDisplayTitle } from '@/features/intel/intelDisplay'
 import { useIntelStore, type IntelFilters, type IntelItem } from '@/stores/useIntelStore'
 import { useIntelAiStore } from '@/stores/useIntelAiStore'
 
@@ -60,6 +61,10 @@ function clampScore(value: number): number {
 
 function formatScore(value: number): string {
   return `${Math.round(clampScore(value) * 100)}%`
+}
+
+function formatRatio(value: number): string {
+  return `${Math.round((value || 0) * 100)}%`
 }
 
 function isSameHeadline(primary: string, original: string) {
@@ -145,6 +150,8 @@ export function IntelPage() {
   const filters = useIntelStore((state) => state.filters)
   const filterOptions = useIntelStore((state) => state.filterOptions)
   const nextCursor = useIntelStore((state) => state.nextCursor)
+  const totalCount = useIntelStore((state) => state.totalCount)
+  const todaySignalStats = useIntelStore((state) => state.todaySignalStats)
   const stale = useIntelStore((state) => state.stale)
   const lastRefreshedAt = useIntelStore((state) => state.lastRefreshedAt)
   const loading = useIntelStore((state) => state.loading)
@@ -233,6 +240,9 @@ export function IntelPage() {
     return 'bg-amber-500 text-black'
   }
 
+  const selectedDisplayTitle = selectedItem ? getIntelDisplayTitle(selectedItem) : ''
+  const selectedDisplayContent = selectedItem ? getIntelDisplayContent(selectedItem) : ''
+
   return (
     <MainLayout>
       <div className="relative h-full flex flex-col bg-[#050505] text-[var(--color-text-primary)] font-sans overflow-hidden selection:bg-blue-500/30">
@@ -251,7 +261,10 @@ export function IntelPage() {
             <div className="flex items-center gap-4 text-[10px] font-bold font-[var(--font-mono)] text-[#666]">
               <div className="flex gap-1.5"><span>同步时间</span> <span className="text-white">{formatFullDate(lastRefreshedAt)}</span></div>
               <div className="flex gap-1.5"><span>运行状态</span> <span className={stale ? 'text-amber-500' : 'text-blue-400'}>{stale ? '更新中' : '实时'}</span></div>
-              <div className="flex gap-1.5"><span>情报总数</span> <span className="text-white">{feed.length}</span></div>
+              <div className="flex gap-1.5"><span>情报总数</span> <span className="text-white">{totalCount}</span></div>
+              <div className="flex gap-1.5"><span>当日偏空</span> <span className="text-[var(--color-short)]">{todaySignalStats?.bearish_count ?? 0}</span> <span className="text-white">{formatRatio(todaySignalStats?.bearish_ratio ?? 0)}</span></div>
+              <div className="flex gap-1.5"><span>当日偏多</span> <span className="text-[var(--color-long)]">{todaySignalStats?.bullish_count ?? 0}</span> <span className="text-white">{formatRatio(todaySignalStats?.bullish_ratio ?? 0)}</span></div>
+              <div className="flex gap-1.5"><span>当日观察</span> <span className="text-amber-400">{todaySignalStats?.neutral_count ?? 0}</span> <span className="text-white">{formatRatio(todaySignalStats?.neutral_ratio ?? 0)}</span></div>
             </div>
           </div>
 
@@ -387,6 +400,7 @@ export function IntelPage() {
                   {feed.map((item) => {
                     const active = item.id === selectedId
                     const signalColor = getSignalColor(item.signal)
+                    const displayTitle = getIntelDisplayTitle(item)
                     
                     return (
                       <div
@@ -421,9 +435,9 @@ export function IntelPage() {
                             )}
                           </div>
                           <div className={`text-xs font-bold leading-snug line-clamp-2 ${active ? 'text-white' : 'text-[#aaa]'}`}>
-                            {item.ai_title}
+                            {displayTitle}
                           </div>
-                          {!isSameHeadline(item.ai_title, item.title) && (
+                          {!isSameHeadline(displayTitle, item.title) && (
                             <div
                               title={item.title}
                               className={`mt-1 text-[10px] leading-snug line-clamp-2 ${active ? 'text-[#7d8590]' : 'text-[#666]'}`}
@@ -493,9 +507,9 @@ export function IntelPage() {
                 {/* 标题 */}
                 <div className="mb-8">
                   <h1 className="text-2xl md:text-3xl font-black text-white leading-tight tracking-tight">
-                    {selectedItem.ai_title}
+                    {selectedDisplayTitle}
                   </h1>
-                  {!isSameHeadline(selectedItem.ai_title, selectedItem.title) && (
+                  {!isSameHeadline(selectedDisplayTitle, selectedItem.title) && (
                     <p className="mt-3 text-sm leading-relaxed text-[#7d8590] max-w-4xl">
                       原始标题：{selectedItem.title}
                     </p>
@@ -510,7 +524,7 @@ export function IntelPage() {
                     <div>
                       <div className="text-[10px] font-black uppercase tracking-widest text-[#666] mb-3 border-b border-[#222] pb-1">AI 深度摘要提炼</div>
                       <p className="text-[13px] leading-relaxed text-[#ccc] font-medium whitespace-pre-wrap">
-                        {selectedItem.summary_ai}
+                        {selectedDisplayContent}
                       </p>
                     </div>
                     
