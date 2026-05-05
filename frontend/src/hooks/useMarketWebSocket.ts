@@ -9,8 +9,9 @@ const RECONNECT_THROTTLE_MS = 4000
 function buildWsCandidates() {
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
   const candidates = [`${protocol}://${window.location.host}/ws/market`]
+  const isLocalDevHost = ['127.0.0.1', 'localhost'].includes(window.location.hostname)
 
-  if (window.location.port === '5173') {
+  if (isLocalDevHost && window.location.port.startsWith('517')) {
     candidates.push(`${protocol}://${window.location.hostname}:8000/ws/market`)
     candidates.push(`${protocol}://127.0.0.1:8000/ws/market`)
     candidates.push(`${protocol}://localhost:8000/ws/market`)
@@ -19,7 +20,7 @@ function buildWsCandidates() {
   return [...new Set(candidates)]
 }
 
-export function useMarketWebSocket() {
+export function useMarketWebSocket(enabled = true) {
   const symbol = useMarketStore((state) => state.symbol)
   const interval = useMarketStore((state) => state.interval)
   const updateKline = useMarketStore((state) => state.updateKline)
@@ -39,15 +40,23 @@ export function useMarketWebSocket() {
     intervalRef.current = interval
     lastRealtimeRef.current = 0
 
+    if (!enabled) return
+
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ action: 'subscribe', symbol, interval }))
     }
 
     void syncLatestKlines(symbol, interval)
-  }, [symbol, interval, syncLatestKlines])
+  }, [enabled, symbol, interval, syncLatestKlines])
 
   // WebSocket 连接只建立一次，断线后自动重连
   useEffect(() => {
+    if (!enabled) {
+      wsRef.current?.close()
+      wsRef.current = null
+      return
+    }
+
     let cancelled = false
     let timer: ReturnType<typeof setTimeout> | null = null
     const wsCandidates = buildWsCandidates()
@@ -135,5 +144,5 @@ export function useMarketWebSocket() {
       wsRef.current?.close()
       wsRef.current = null
     }
-  }, [updateKline, syncLatestKlines])
+  }, [enabled, updateKline, syncLatestKlines])
 }

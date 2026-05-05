@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 
 import httpx
@@ -9,9 +10,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.backtest.models import HistoricalKline
 
 BINANCE_BASE_URL = "https://api.binance.com"
+logger = logging.getLogger(__name__)
 
 # 获取代理配置
 PROXY = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
+_market_http_client: httpx.AsyncClient | None = None
 
 # MVP 支持的交易对
 SUPPORTED_SYMBOLS = [
@@ -24,37 +27,51 @@ SUPPORTED_SYMBOLS = [
 ]
 
 
+async def get_market_http_client() -> httpx.AsyncClient:
+    global _market_http_client
+    if _market_http_client is None or _market_http_client.is_closed:
+        _market_http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True, proxy=PROXY)
+    return _market_http_client
+
+
+async def close_market_http_client() -> None:
+    global _market_http_client
+    if _market_http_client is None:
+        return
+    await _market_http_client.aclose()
+    _market_http_client = None
+
+
 async def fetch_klines(symbol: str, interval: str, limit: int) -> list[dict]:
     """从 Binance 获取 K 线数据"""
     url = f"{BINANCE_BASE_URL}/api/v3/klines"
 
     try:
-        # 使用系统代理设置（从环境变量）
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, proxy=PROXY) as client:
-            all_rows: list[list] = []
-            end_time: int | None = None
+        client = await get_market_http_client()
+        all_rows: list[list] = []
+        end_time: int | None = None
 
-            while len(all_rows) < limit:
-                remaining = limit - len(all_rows)
-                params = {"symbol": symbol, "interval": interval, "limit": min(remaining, 1000)}
-                if end_time is not None:
-                    params["endTime"] = end_time
+        while len(all_rows) < limit:
+            remaining = limit - len(all_rows)
+            params = {"symbol": symbol, "interval": interval, "limit": min(remaining, 1000)}
+            if end_time is not None:
+                params["endTime"] = end_time
 
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-                raw = resp.json()
-                if not raw:
-                    break
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            raw = resp.json()
+            if not raw:
+                break
 
-                all_rows = raw + all_rows
-                if len(raw) < params["limit"]:
-                    break
+            all_rows = raw + all_rows
+            if len(raw) < params["limit"]:
+                break
 
-                earliest_open_time = int(raw[0][0])
-                next_end_time = earliest_open_time - 1
-                if end_time is not None and next_end_time >= end_time:
-                    break
-                end_time = next_end_time
+            earliest_open_time = int(raw[0][0])
+            next_end_time = earliest_open_time - 1
+            if end_time is not None and next_end_time >= end_time:
+                break
+            end_time = next_end_time
 
         return [
             {
@@ -67,8 +84,8 @@ async def fetch_klines(symbol: str, interval: str, limit: int) -> list[dict]:
             }
             for k in all_rows[-limit:]
         ]
-    except Exception as e:
-        print(f"[Market] Error fetching klines: {e}")
+    except Exception:
+        logger.exception("Error fetching Binance klines for %s %s", symbol, interval)
         raise
 
 
@@ -135,39 +152,39 @@ async def fetch_current_prices(symbols: list[str]) -> dict[str, float]:
 
     unique_symbols = list(dict.fromkeys(symbols))
     url = f"{BINANCE_BASE_URL}/api/v3/ticker/price"
+    client = await get_market_http_client()
 
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, proxy=PROXY) as client:
+    try:
+        symbols_json = '["' + '","'.join(unique_symbols) + '"]'
+        resp = await client.get(url, params={"symbols": symbols_json})
+        resp.raise_for_status()
+        raw = resp.json()
+        return {
+            item["symbol"]: float(item["price"])
+            for item in raw
+        }
+    except Exception as exc:
+        logger.warning("Batch price fetch failed, falling back to per-symbol fetch: %s", exc)
+
+    async def fetch_single(symbol: str) -> tuple[str, float] | None:
         try:
-            symbols_json = '["' + '","'.join(unique_symbols) + '"]'
-            resp = await client.get(url, params={"symbols": symbols_json})
+            resp = await client.get(url, params={"symbol": symbol})
             resp.raise_for_status()
             raw = resp.json()
-            return {
-                item["symbol"]: float(item["price"])
-                for item in raw
-            }
-        except Exception as e:
-            print(f"[Market] Batch price fetch failed, fallback to per-symbol fetch: {e}")
+            return raw["symbol"], float(raw["price"])
+        except Exception:
+            # 无效/退市交易对直接跳过，不影响其他价格
+            return None
 
-        async def fetch_single(symbol: str) -> tuple[str, float] | None:
-            try:
-                resp = await client.get(url, params={"symbol": symbol})
-                resp.raise_for_status()
-                raw = resp.json()
-                return raw["symbol"], float(raw["price"])
-            except Exception:
-                # 无效/退市交易对直接跳过，不影响其他价格
-                return None
+    entries = await asyncio.gather(*(fetch_single(symbol) for symbol in unique_symbols))
+    result: dict[str, float] = {}
+    for entry in entries:
+        if entry is None:
+            continue
+        symbol, price = entry
+        result[symbol] = price
 
-        entries = await asyncio.gather(*(fetch_single(symbol) for symbol in unique_symbols))
-        result: dict[str, float] = {}
-        for entry in entries:
-            if entry is None:
-                continue
-            symbol, price = entry
-            result[symbol] = price
-
-        return result
+    return result
 
 
 async def fetch_ticker_snapshots(symbols: list[str]) -> list[dict]:
@@ -177,40 +194,40 @@ async def fetch_ticker_snapshots(symbols: list[str]) -> list[dict]:
 
     unique_symbols = list(dict.fromkeys(symbol.upper() for symbol in symbols))
     url = f"{BINANCE_BASE_URL}/api/v3/ticker/24hr"
+    client = await get_market_http_client()
 
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, proxy=PROXY) as client:
+    try:
+        resp = await client.get(url, params={"symbols": json.dumps(unique_symbols, separators=(",", ":"))})
+        resp.raise_for_status()
+        raw = resp.json()
+        if isinstance(raw, dict):
+            raw = [raw]
+
+        lookup = {
+            item["symbol"]: {
+                "symbol": item["symbol"],
+                "price": float(item["lastPrice"]),
+                "price_change_pct": float(item["priceChangePercent"]),
+            }
+            for item in raw
+            if item.get("symbol")
+        }
+        return [lookup[symbol] for symbol in unique_symbols if symbol in lookup]
+    except Exception as exc:
+        logger.warning("Batch ticker fetch failed, falling back to per-symbol fetch: %s", exc)
+
+    async def fetch_single(symbol: str) -> dict | None:
         try:
-            resp = await client.get(url, params={"symbols": json.dumps(unique_symbols, separators=(",", ":"))})
+            resp = await client.get(url, params={"symbol": symbol})
             resp.raise_for_status()
             raw = resp.json()
-            if isinstance(raw, dict):
-                raw = [raw]
-
-            lookup = {
-                item["symbol"]: {
-                    "symbol": item["symbol"],
-                    "price": float(item["lastPrice"]),
-                    "price_change_pct": float(item["priceChangePercent"]),
-                }
-                for item in raw
-                if item.get("symbol")
+            return {
+                "symbol": raw["symbol"],
+                "price": float(raw["lastPrice"]),
+                "price_change_pct": float(raw["priceChangePercent"]),
             }
-            return [lookup[symbol] for symbol in unique_symbols if symbol in lookup]
-        except Exception as e:
-            print(f"[Market] Batch ticker fetch failed, fallback to per-symbol fetch: {e}")
+        except Exception:
+            return None
 
-        async def fetch_single(symbol: str) -> dict | None:
-            try:
-                resp = await client.get(url, params={"symbol": symbol})
-                resp.raise_for_status()
-                raw = resp.json()
-                return {
-                    "symbol": raw["symbol"],
-                    "price": float(raw["lastPrice"]),
-                    "price_change_pct": float(raw["priceChangePercent"]),
-                }
-            except Exception:
-                return None
-
-        entries = await asyncio.gather(*(fetch_single(symbol) for symbol in unique_symbols))
-        return [entry for entry in entries if entry is not None]
+    entries = await asyncio.gather(*(fetch_single(symbol) for symbol in unique_symbols))
+    return [entry for entry in entries if entry is not None]

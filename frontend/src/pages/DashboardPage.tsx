@@ -13,6 +13,7 @@ import { OrderForm } from '@/features/trade/OrderForm'
 import { Group, Panel, Separator } from 'react-resizable-panels'
 import { FlashText } from '@/shared/FlashText'
 import { MarketWatchlist } from '@/features/market/MarketWatchlist'
+import { usePageActivity } from '@/hooks/usePageActivity'
 
 const INDICATOR_PRESETS: { label: string; config: IndicatorConfig }[] = [
   { label: 'MA20', config: { type: 'MA', period: 20 } },
@@ -29,6 +30,7 @@ const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
 const POSITION_REFRESH_MS = 3000
 
 export function DashboardPage() {
+  const active = usePageActivity()
   const [searchParams] = useSearchParams()
   const symbol = useMarketStore((state) => state.symbol)
   const interval = useMarketStore((state) => state.interval)
@@ -49,11 +51,31 @@ export function DashboardPage() {
   const signalSymbol = useBacktestSignalStore((state) => state.symbol)
   const signalInterval = useBacktestSignalStore((state) => state.interval)
   const [activeIndicators, setActiveIndicators] = useState<IndicatorConfig[]>([])
+  const [currency, setCurrency] = useState<'USDT' | 'CNY'>('USDT')
+  const [usdtToCnyRate, setUsdtToCnyRate] = useState(7.25)
   const initialLoadRef = useRef(false)
 
-  useMarketWebSocket()
+  // 获取实时 USD/CNY 汇率
+  useEffect(() => {
+    let cancelled = false
+    const fetchRate = async () => {
+      try {
+        const res = await fetch('https://api.exchangerate-api.com/v4/latest/USD')
+        const data = await res.json()
+        if (!cancelled && data?.rates?.CNY) {
+          setUsdtToCnyRate(data.rates.CNY)
+        }
+      } catch { /* 失败保持上一次汇率 */ }
+    }
+    fetchRate()
+    return () => { cancelled = true }
+  }, [])
+
+  useMarketWebSocket(active)
 
   useEffect(() => {
+    if (!active) return
+
     void Promise.allSettled([
       fetchSymbols(),
       fetchPositions(),
@@ -61,16 +83,20 @@ export function DashboardPage() {
       fetchConfig(),
       fetchBalance(),
     ])
-  }, [fetchBalance, fetchConfig, fetchPositions, fetchStatus, fetchSymbols, fetchKlines])
+  }, [active, fetchBalance, fetchConfig, fetchPositions, fetchStatus, fetchSymbols, fetchKlines])
 
   useEffect(() => {
+    if (!active) return
+
     const timer = window.setInterval(() => {
       void fetchPositions({ background: true })
     }, POSITION_REFRESH_MS)
     return () => window.clearInterval(timer)
-  }, [fetchPositions])
+  }, [active, fetchPositions])
 
   useEffect(() => {
+    if (!active) return
+
     const urlSymbol = searchParams.get('symbol')
     const urlInterval = searchParams.get('interval')
     const targetSymbol = urlSymbol || signalSymbol || symbol
@@ -85,7 +111,7 @@ export function DashboardPage() {
     if (targetSymbol !== symbol || targetInterval !== interval) {
       fetchKlines(targetSymbol, targetInterval)
     }
-  }, [searchParams, signalSymbol, signalInterval, klinesLength, symbol, interval])
+  }, [active, searchParams, signalSymbol, signalInterval, klinesLength, symbol, interval, fetchKlines])
 
   const handleChangeTf = (tf: string) => void fetchKlines(symbol, tf)
   const handleClose = async (orderId: string | null) => {
@@ -233,19 +259,25 @@ export function DashboardPage() {
             <div className="h-full flex flex-col bg-[var(--color-bg-card)] border-l border-[var(--color-border)] overflow-hidden">
               {/* 资产概览 */}
               <div className="p-4 border-b border-[var(--color-border)] shrink-0 bg-gradient-to-br from-[var(--color-bg-hover)]/50 to-transparent">
-                <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[9px] text-[var(--color-text-disabled)] uppercase font-black tracking-widest leading-none">资产概览</span>
+                  <button onClick={() => setCurrency(currency === 'USDT' ? 'CNY' : 'USDT')} className="text-[9px] font-bold text-[var(--color-accent)] hover:text-[var(--color-accent-hover)] uppercase transition-colors cursor-pointer">{currency === 'USDT' ? 'USDT ⇄ ¥' : '¥ ⇄ USDT'}</button>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
                   <div className="flex flex-col">
-                    <span className="text-[9px] text-[var(--color-text-disabled)] uppercase font-black tracking-widest leading-none mb-1.5">可用余额</span>
-                    <div className="flex items-baseline gap-1.5">
-                      <span className="text-2xl font-black font-[var(--font-mono)] tracking-tight text-[var(--color-text-primary)] leading-none">{balance.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
-                      <span className="text-[10px] font-bold text-[var(--color-text-disabled)] uppercase">USDT</span>
-                    </div>
+                    <span className="text-[8px] text-[var(--color-text-disabled)] uppercase font-black tracking-wider leading-none mb-1">可用余额</span>
+                    <span className="text-lg font-black font-[var(--font-mono)] tracking-tight text-[var(--color-text-primary)] leading-none">{currency === 'USDT' ? balance.toLocaleString(undefined, { minimumFractionDigits: 2 }) : (balance * usdtToCnyRate).toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
                   </div>
-                  <div className="flex flex-col items-end">
-                    <span className={`text-[8px] px-1.5 py-0.5 rounded font-black tracking-tighter ${balanceMode === 'SIMULATED' ? 'bg-amber-500/10 text-amber-500 border border-amber-500/20' : 'bg-blue-500/10 text-blue-500 border border-blue-500/20'}`}>
-                      {balanceMode === 'SIMULATED' ? '模拟账户' : '实盘账户'}
-                    </span>
+                  <div className="flex flex-col">
+                    <span className="text-[8px] text-[var(--color-text-disabled)] uppercase font-black tracking-wider leading-none mb-1">资产总额</span>
+                    <span className="text-lg font-black font-[var(--font-mono)] tracking-tight text-[var(--color-text-primary)] leading-none">{(() => { const total = balance + positions.reduce((s, p) => s + p.quantity * p.current_price, 0); return currency === 'USDT' ? total.toLocaleString(undefined, { minimumFractionDigits: 2 }) : (total * usdtToCnyRate).toLocaleString(undefined, { minimumFractionDigits: 2 }); })()}</span>
                   </div>
+                </div>
+                <div className="mt-2 flex items-center justify-between">
+                  <span className={`text-[8px] px-1.5 py-0.5 rounded font-black tracking-tighter ${balanceMode === 'SIMULATED' ? 'bg-amber-500/10 text-amber-500 border border-amber-500/20' : 'bg-blue-500/10 text-blue-500 border border-blue-500/20'}`}>
+                    {balanceMode === 'SIMULATED' ? '模拟账户' : '实盘账户'}
+                  </span>
+                  {positions.length > 0 && <span className="text-[8px] text-[var(--color-text-disabled)]">{positions.length} 个持仓</span>}
                 </div>
               </div>
 

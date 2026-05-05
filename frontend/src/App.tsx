@@ -1,19 +1,76 @@
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router'
-import { useEffect, useState } from 'react'
+import { lazy, Suspense, useEffect, useState, type ReactNode } from 'react'
 import { useAuthStore } from '@/stores/useAuthStore'
+import { PageActivityProvider } from '@/hooks/usePageActivity'
 
-// 静态导入（页面 bundle 很小，切换无感知）
-import { LoginPage } from '@/pages/LoginPage'
-import { RegisterPage } from '@/pages/RegisterPage'
-import { SetupPage } from '@/pages/SetupPage'
-import { DashboardPage } from '@/pages/DashboardPage'
-import { IntelPage } from '@/pages/IntelPage'
-import { BacktestPage } from '@/pages/BacktestPage'
-import { SettingsPage } from '@/pages/SettingsPage'
 import { IntelAiDialog } from '@/features/intel/IntelAiDialog'
+
+const LoginPage = lazy(async () => {
+  const module = await import('@/pages/LoginPage')
+  return { default: module.LoginPage }
+})
+
+const RegisterPage = lazy(async () => {
+  const module = await import('@/pages/RegisterPage')
+  return { default: module.RegisterPage }
+})
+
+const SetupPage = lazy(async () => {
+  const module = await import('@/pages/SetupPage')
+  return { default: module.SetupPage }
+})
+
+const DashboardPage = lazy(async () => {
+  const module = await import('@/pages/DashboardPage')
+  return { default: module.DashboardPage }
+})
+
+const IntelPage = lazy(async () => {
+  const module = await import('@/pages/IntelPage')
+  return { default: module.IntelPage }
+})
+
+const BacktestPage = lazy(async () => {
+  const module = await import('@/pages/BacktestPage')
+  return { default: module.BacktestPage }
+})
+
+const SettingsPage = lazy(async () => {
+  const module = await import('@/pages/SettingsPage')
+  return { default: module.SettingsPage }
+})
+
+function AppBootSplash() {
+  return (
+    <div className="min-h-screen bg-[var(--color-bg-primary)] text-[var(--color-text-secondary)] flex items-center justify-center text-sm">
+      正在加载...
+    </div>
+  )
+}
+
+function RouteChunkFallback() {
+  return (
+    <div className="h-full bg-[var(--color-bg-primary)] text-[var(--color-text-secondary)] flex items-center justify-center text-sm">
+      正在加载...
+    </div>
+  )
+}
+
+function PageChunk({ children }: { children: ReactNode }) {
+  return (
+    <Suspense fallback={<RouteChunkFallback />}>
+      {children}
+    </Suspense>
+  )
+}
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated)
+  const initialized = useAuthStore((state) => state.initialized)
+
+  if (!initialized) {
+    return <AppBootSplash />
+  }
 
   return isAuthenticated ? <>{children}</> : <Navigate to="/login" />
 }
@@ -45,22 +102,30 @@ function KeepAliveRoutes() {
     <div style={{ position: 'relative', height: '100vh' }}>
       {mounted.has('/') && (
         <PageSlot active={active === '/'}>
-          <DashboardPage />
+          <PageChunk>
+            <DashboardPage />
+          </PageChunk>
         </PageSlot>
       )}
       {mounted.has('/backtest') && (
         <PageSlot active={active === '/backtest'}>
-          <BacktestPage />
+          <PageChunk>
+            <BacktestPage />
+          </PageChunk>
         </PageSlot>
       )}
       {mounted.has('/intel') && (
         <PageSlot active={active === '/intel'}>
-          <IntelPage />
+          <PageChunk>
+            <IntelPage />
+          </PageChunk>
         </PageSlot>
       )}
       {mounted.has('/settings') && (
         <PageSlot active={active === '/settings'}>
-          <SettingsPage />
+          <PageChunk>
+            <SettingsPage />
+          </PageChunk>
         </PageSlot>
       )}
       <IntelAiDialog />
@@ -79,7 +144,9 @@ function PageSlot({ active, children }: { active: boolean; children: React.React
         contentVisibility: active ? 'visible' : 'auto',
       }}
     >
-      {children}
+      <PageActivityProvider active={active}>
+        {children}
+      </PageActivityProvider>
     </div>
   )
 }
@@ -94,9 +161,9 @@ export function App() {
   return (
     <BrowserRouter>
       <Routes>
-        <Route path="/login" element={<LoginPage />} />
-        <Route path="/register" element={<RegisterPage />} />
-        <Route path="/setup" element={<ProtectedRoute><SetupPage /></ProtectedRoute>} />
+        <Route path="/login" element={<PageChunk><LoginPage /></PageChunk>} />
+        <Route path="/register" element={<PageChunk><RegisterPage /></PageChunk>} />
+        <Route path="/setup" element={<ProtectedRoute><PageChunk><SetupPage /></PageChunk></ProtectedRoute>} />
         <Route path="/*" element={<ProtectedRoute><KeepAliveRoutes /></ProtectedRoute>} />
       </Routes>
     </BrowserRouter>

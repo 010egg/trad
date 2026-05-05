@@ -25,19 +25,42 @@ interface LoginResponse {
   refresh_token: string
 }
 
+function getStorage() {
+  const storage = globalThis.localStorage
+  if (
+    !storage ||
+    typeof storage.getItem !== 'function' ||
+    typeof storage.setItem !== 'function' ||
+    typeof storage.removeItem !== 'function'
+  ) {
+    return null
+  }
+  return storage
+}
+
 function hasSessionToken() {
-  return Boolean(localStorage.getItem('access_token'))
+  return Boolean(getStorage()?.getItem('access_token'))
+}
+
+function persistSession(session: LoginResponse) {
+  const storage = getStorage()
+  if (!storage) return
+  storage.setItem('access_token', session.access_token)
+  storage.setItem('refresh_token', session.refresh_token)
 }
 
 function clearSession() {
-  localStorage.removeItem('access_token')
-  localStorage.removeItem('refresh_token')
+  const storage = getStorage()
+  if (!storage) return
+  storage.removeItem('access_token')
+  storage.removeItem('refresh_token')
 }
 
 export const useAuthStore = create<AuthState>((set) => ({
+  // 有本地 token 时，先等待 /auth/me 校验完成，再允许受保护页面挂载。
   user: null,
-  isAuthenticated: hasSessionToken(),
-  initialized: true,  // 始终初始化为 true，不阻塞页面显示
+  isAuthenticated: false,
+  initialized: !hasSessionToken(),
   loading: false,
   error: null,
 
@@ -45,8 +68,7 @@ export const useAuthStore = create<AuthState>((set) => ({
     try {
       set({ loading: true, error: null })
       const session: LoginResponse = await api.post('/auth/login', { email, password })
-      localStorage.setItem('access_token', session.access_token)
-      localStorage.setItem('refresh_token', session.refresh_token)
+      persistSession(session)
 
       const user: User = await api.get('/auth/me')
       set({
@@ -115,6 +137,11 @@ export const useAuthStore = create<AuthState>((set) => ({
     }
 
     try {
+      set({
+        initialized: false,
+        loading: true,
+        error: null,
+      })
       const user: User = await api.get('/auth/me')
       set({
         user,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mergeLatestKlines, type Kline } from '@/stores/useMarketStore'
+import { MARKET_KLINE_LIMIT, mergeLatestKlines, type Kline } from '@/stores/useMarketStore'
 
 function createKline(time: number, close = time): Kline {
   return {
@@ -24,13 +24,13 @@ describe('mergeLatestKlines', () => {
   })
 
   it('appends new candles and keeps only the latest 500 points', () => {
-    const prev = Array.from({ length: 500 }, (_, index) => createKline(index + 1))
-    const incoming = [createKline(501)]
+    const prev = Array.from({ length: MARKET_KLINE_LIMIT }, (_, index) => createKline(index + 1))
+    const incoming = [createKline(MARKET_KLINE_LIMIT + 1)]
 
     const merged = mergeLatestKlines(prev, incoming)
 
-    expect(merged).toHaveLength(500)
+    expect(merged).toHaveLength(MARKET_KLINE_LIMIT)
     expect(merged[0]?.time).toBe(2)
-    expect(merged.at(-1)?.time).toBe(501)
+    expect(merged.at(-1)?.time).toBe(MARKET_KLINE_LIMIT + 1)
   })
 })

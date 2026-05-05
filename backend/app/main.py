@@ -15,6 +15,7 @@ from app.modules.risk.router import router as risk_router
 from app.modules.trade.router import router as trade_router
 from app.ws.router import router as ws_router
 from app.ws.binance_ws import manager as ws_manager
+from app.modules.market.service import close_market_http_client
 
 _logger = logging.getLogger("intel.auto_refresh")
 
@@ -76,6 +77,7 @@ async def lifespan(app: FastAPI):
     yield
     refresh_task.cancel()
     await asyncio.gather(refresh_task, return_exceptions=True)
+    await close_market_http_client()
     await ws_manager.shutdown()
 
 
@@ -88,7 +90,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5173", "http://localhost:5174"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

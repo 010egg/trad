@@ -1,10 +1,12 @@
 import { useEffect } from 'react'
 import { useMarketStore } from '@/stores/useMarketStore'
 import { FlashText } from '@/shared/FlashText'
+import { usePageActivity } from '@/hooks/usePageActivity'
 
 const WATCHLIST_REFRESH_MS = 3000
 
 export function MarketWatchlist() {
+  const active = usePageActivity()
   const symbols = useMarketStore((state) => state.symbols)
   const symbol = useMarketStore((state) => state.symbol)
   const fetchKlines = useMarketStore((state) => state.fetchKlines)
@@ -16,6 +18,8 @@ export function MarketWatchlist() {
   const handleChangeSymbol = (s: string) => void fetchKlines(s, interval)
 
   useEffect(() => {
+    if (!active) return
+
     const symbolList = symbols.map((item) => item.symbol)
     if (!symbolList.length) return
 
@@ -26,7 +30,7 @@ export function MarketWatchlist() {
     }, WATCHLIST_REFRESH_MS)
 
     return () => window.clearInterval(timer)
-  }, [symbols, fetchTickers])
+  }, [active, symbols, fetchTickers])
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
